@@ -342,6 +342,11 @@ if uploaded_file is not None:
                 use_container_width=True
             )
 
+        st.markdown("---")
+        if st.button("🔄 Enviar Outro Arquivo de Áudio"):
+            st.session_state.clear()
+            st.rerun()
+
         if st.session_state.get("page_images"):
             st.markdown("### 🎼 Visualização da Partitura")
             for idx, img_bytes in enumerate(st.session_state["page_images"]):
