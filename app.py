@@ -1,23 +1,38 @@
 import os
 import gc
 import uuid
+import shutil
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
 import librosa
 import soundfile as sf
+import pretty_midi
 import music21
 import streamlit as st
-from basic_pitch.inference import predict
+from basic_pitch.inference import predict, Model
 from basic_pitch import ICASSP_2022_MODEL_PATH
 
-# Configuração da página
 st.set_page_config(page_title="Partitura.ai", page_icon="🎵", layout="centered")
 
 UPLOAD_DIR = Path("temp_uploads")
 OUTPUT_DIR = Path("temp_outputs")
 for d in [UPLOAD_DIR, OUTPUT_DIR]:
     d.mkdir(exist_ok=True)
+
+# Carrega o modelo da IA apenas uma vez na memória RAM do servidor
+@st.cache_resource
+def load_ai_model():
+    return Model(ICASSP_2022_MODEL_PATH)
+
+ai_model = load_ai_model()
+
+class MockNote:
+    def __init__(self, start, end, pitch, velocity):
+        self.start = start
+        self.end = end
+        self.pitch = pitch
+        self.velocity = velocity
 
 st.title("🎵 Partitura.ai - Motor Universal")
 st.markdown("### Transcrição Musical Inteligente e Completa por IA")
@@ -26,7 +41,7 @@ st.write("Selecione ou arraste um ficheiro de áudio (MP3, WAV, M4A, FLAC, OGG) 
 uploaded_file = st.file_uploader("Escolha um ficheiro de áudio", type=["mp3", "wav", "m4a", "flac", "ogg"])
 
 if uploaded_file is not None:
-    st.audio(uploaded_file, format='audio/mp3')
+    st.audio(uploaded_file)
     
     if st.button("✨ Gerar Partitura Completa", type="primary"):
         session_id = uuid.uuid4().hex[:8]
@@ -37,11 +52,9 @@ if uploaded_file is not None:
 
         with st.spinner("⚡ A processar a música inteira com IA em blocos otimizados... Por favor, aguarde."):
             try:
-                # Salva o ficheiro enviado
                 with open(safe_input_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
 
-                # 1. Carrega o áudio completo em memória de forma limpa
                 y_full, sr = librosa.load(str(safe_input_path), sr=22050, mono=True)
                 total_duration = len(y_full) / sr
 
@@ -53,42 +66,17 @@ if uploaded_file is not None:
                 if bpm <= 0: bpm = 120.0
                 if bpm > 165: bpm /= 2.0
                 elif bpm < 58: bpm *= 2.0
+                bpm = round(bpm, 1)
                 time_sig = "2/4" if bpm >= 128 else "4/4"
 
                 del y_harmonic_full, onset_env
                 gc.collect()
 
-                # Processamento em Chunks (blocos de 30 segundos) para suportar músicas longas sem travar
                 chunk_duration = 30.0
                 all_notes = []
-
-                class MockNote:
-                    def __init__(self, start, end, pitch, velocity):
-                        self.start = start
-                        self.end = end
-                        self.pitch = pitch
-                        self.velocity = velocity
-
-                class MockInstrument:
-                    def __init__(self, notes):
-                        self.notes = notes
-
-                class MockMidiData:
-                    def __init__(self, instruments, notes):
-                        self.instruments = instruments
-                        self.notes = notes
-                        
-                    def write(self, path):
-                        import pretty_midi
-                        pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
-                        inst = pretty_midi.Instrument(program=0)
-                        for n in self.notes:
-                            inst.notes.append(pretty_midi.Note(velocity=int(n.velocity), pitch=int(n.pitch), start=float(n.start), end=float(n.end)))
-                        pm.instruments.append(inst)
-                        pm.write(path)
-
                 start_time = 0.0
                 chunk_idx = 0
+
                 while start_time < total_duration:
                     end_time = min(start_time + chunk_duration, total_duration)
                     start_sample = int(start_time * sr)
@@ -102,13 +90,11 @@ if uploaded_file is not None:
                     chunk_file = session_dir / f"chunk_{chunk_idx}.wav"
                     sf.write(str(chunk_file), y_harm_chunk, sr, subtype='PCM_16')
 
-                    _, midi_data_chunk, _ = predict(str(chunk_file.resolve()), ICASSP_2022_MODEL_PATH)
+                    _, midi_data_chunk, _ = predict(str(chunk_file.resolve()), ai_model)
                     
                     for inst in midi_data_chunk.instruments:
                         for n in inst.notes:
-                            real_start = n.start + start_time
-                            real_end = n.end + start_time
-                            all_notes.append(MockNote(real_start, real_end, n.pitch, n.velocity))
+                            all_notes.append(MockNote(n.start + start_time, n.end + start_time, n.pitch, n.velocity))
 
                     try:
                         chunk_file.unlink()
@@ -142,10 +128,14 @@ if uploaded_file is not None:
                                 n.end = n.start + grid_step
                             processed_notes.append(n)
 
-                    midi_filename = f"partitura_{session_id}.mid"
-                    midi_path = OUTPUT_DIR / midi_filename
-                    final_midi = MockMidiData([MockInstrument(processed_notes)], processed_notes)
-                    final_midi.write(str(midi_path))
+                    # Salva ficheiro MIDI
+                    midi_path = OUTPUT_DIR / f"partitura_{session_id}.mid"
+                    pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
+                    inst = pretty_midi.Instrument(program=0)
+                    for n in processed_notes:
+                        inst.notes.append(pretty_midi.Note(velocity=int(n.velocity), pitch=int(n.pitch), start=float(n.start), end=float(n.end)))
+                    pm.instruments.append(inst)
+                    pm.write(str(midi_path))
 
                     # Construção da partitura estruturada com music21
                     clusters_by_ql = defaultdict(list)
@@ -184,6 +174,11 @@ if uploaded_file is not None:
                     detected_key = ks.getSolution(part)
                     part.insert(0, music21.key.KeySignature(detected_key.sharps))
 
+                    # Gera ficheiro MusicXML (Partitura editável)
+                    xml_path = OUTPUT_DIR / f"partitura_{session_id}.musicxml"
+                    part.makeMeasures(inPlace=True)
+                    part.write('musicxml', fp=str(xml_path))
+
                     tonica_map = {'C': 'Dó', 'C#': 'Dó#', 'D': 'Ré', 'E': 'Mi', 'F': 'Fá', 'G': 'Sol', 'A': 'Lá', 'B': 'Si'}
                     tonic_pt = tonica_map.get(detected_key.tonic.name.replace('-', ''), detected_key.tonic.name)
                     mode_pt = "Maior" if detected_key.mode == "major" else "Menor"
@@ -191,23 +186,39 @@ if uploaded_file is not None:
                     st.success("✨ Partitura da música inteira gerada com sucesso!")
                     st.info(f"🎵 Ritmo: {bpm} BPM | Compasso: {time_sig} | Tom: {tonic_pt} {mode_pt} | Clave de Sol")
 
-                    # Botão para download do ficheiro MIDI
-                    with open(midi_path, "rb") as mf:
-                        st.download_button(
-                            label="📥 Baixar Ficheiro MIDI Completo",
-                            data=mf,
-                            file_name="partitura_completa.mid",
-                            mime="audio/midi"
-                        )
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        with open(midi_path, "rb") as mf:
+                            st.download_button(
+                                label="📥 Baixar MIDI (.mid)",
+                                data=mf.read(),
+                                file_name="partitura_completa.mid",
+                                mime="audio/midi",
+                                use_container_width=True
+                            )
+                    with col2:
+                        with open(xml_path, "rb") as xf:
+                            st.download_button(
+                                label="🎼 Baixar Partitura (.musicxml)",
+                                data=xf.read(),
+                                file_name="partitura_clave_de_sol.musicxml",
+                                mime="application/vnd.recordare.musicxml+xml",
+                                use_container_width=True
+                            )
+
+                    try:
+                        midi_path.unlink()
+                        xml_path.unlink()
+                    except Exception:
+                        pass
 
             except Exception as e:
                 st.error(f"Ocorreu um erro no processamento: {str(e)}")
             finally:
                 if safe_input_path.exists():
                     try: safe_input_path.unlink()
-                    except: pass
-                import shutil
+                    except Exception: pass
                 if session_dir.exists():
                     try: shutil.rmtree(session_dir)
-                    except: pass
+                    except Exception: pass
                 gc.collect()
