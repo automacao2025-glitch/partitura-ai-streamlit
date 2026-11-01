@@ -10,7 +10,7 @@ import soundfile as sf
 import pretty_midi
 import music21
 import streamlit as st
-from basic_pitch.inference import predict, Model
+from basic_pitch.inference import predict
 from basic_pitch import ICASSP_2022_MODEL_PATH
 
 st.set_page_config(page_title="Partitura.ai", page_icon="🎵", layout="centered")
@@ -19,13 +19,6 @@ UPLOAD_DIR = Path("temp_uploads")
 OUTPUT_DIR = Path("temp_outputs")
 for d in [UPLOAD_DIR, OUTPUT_DIR]:
     d.mkdir(exist_ok=True)
-
-# Carrega o modelo da IA apenas uma vez na memória RAM do servidor
-@st.cache_resource
-def load_ai_model():
-    return Model(ICASSP_2022_MODEL_PATH)
-
-ai_model = load_ai_model()
 
 class MockNote:
     def __init__(self, start, end, pitch, velocity):
@@ -41,7 +34,7 @@ st.write("Selecione ou arraste um ficheiro de áudio (MP3, WAV, M4A, FLAC, OGG) 
 uploaded_file = st.file_uploader("Escolha um ficheiro de áudio", type=["mp3", "wav", "m4a", "flac", "ogg"])
 
 if uploaded_file is not None:
-    st.audio(uploaded_file)
+    st.audio(uploaded_file.getvalue(), format=uploaded_file.type)
     
     if st.button("✨ Gerar Partitura Completa", type="primary"):
         session_id = uuid.uuid4().hex[:8]
@@ -90,7 +83,7 @@ if uploaded_file is not None:
                     chunk_file = session_dir / f"chunk_{chunk_idx}.wav"
                     sf.write(str(chunk_file), y_harm_chunk, sr, subtype='PCM_16')
 
-                    _, midi_data_chunk, _ = predict(str(chunk_file.resolve()), ai_model)
+                    _, midi_data_chunk, _ = predict(str(chunk_file.resolve()), ICASSP_2022_MODEL_PATH)
                     
                     for inst in midi_data_chunk.instruments:
                         for n in inst.notes:
