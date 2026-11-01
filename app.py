@@ -1,24 +1,51 @@
+import sys
 import os
 import gc
 import uuid
 import shutil
 from pathlib import Path
 from collections import defaultdict
+
+# BLINDAGEM DEFINITIVA CONTRA ERRO DE PKG_RESOURCES NO PYTHON 3.11+
+try:
+    import pkg_resources
+except ImportError:
+    import types
+    import importlib.resources
+    import importlib.metadata
+    pkg_resources = types.ModuleType("pkg_resources")
+    def resource_filename(package_or_requirement, resource_name):
+        return str(importlib.resources.files(package_or_requirement).joinpath(resource_name))
+    def get_distribution(dist):
+        class Dist:
+            version = importlib.metadata.version(dist)
+        return Dist()
+    pkg_resources.resource_filename = resource_filename
+    pkg_resources.get_distribution = get_distribution
+    pkg_resources.DistributionNotFound = importlib.metadata.PackageNotFoundError
+    sys.modules["pkg_resources"] = pkg_resources
+
+import streamlit as st
+
+# A configuração da página deve ser o primeiro comando Streamlit
+st.set_page_config(page_title="Partitura.ai", page_icon="🎵", layout="centered")
+
 import numpy as np
 import librosa
 import soundfile as sf
 import pretty_midi
 import music21
-import streamlit as st
-from basic_pitch.inference import predict
+from basic_pitch.inference import predict, Model
 from basic_pitch import ICASSP_2022_MODEL_PATH
-
-st.set_page_config(page_title="Partitura.ai", page_icon="🎵", layout="centered")
 
 UPLOAD_DIR = Path("temp_uploads")
 OUTPUT_DIR = Path("temp_outputs")
 for d in [UPLOAD_DIR, OUTPUT_DIR]:
     d.mkdir(exist_ok=True)
+
+@st.cache_resource
+def get_basic_pitch_model():
+    return Model(ICASSP_2022_MODEL_PATH)
 
 class MockNote:
     def __init__(self, start, end, pitch, velocity):
@@ -34,7 +61,7 @@ st.write("Selecione ou arraste um ficheiro de áudio (MP3, WAV, M4A, FLAC, OGG) 
 uploaded_file = st.file_uploader("Escolha um ficheiro de áudio", type=["mp3", "wav", "m4a", "flac", "ogg"])
 
 if uploaded_file is not None:
-    st.audio(uploaded_file.getvalue(), format=uploaded_file.type)
+    st.audio(uploaded_file.getvalue())
     
     if st.button("✨ Gerar Partitura Completa", type="primary"):
         session_id = uuid.uuid4().hex[:8]
@@ -45,6 +72,8 @@ if uploaded_file is not None:
 
         with st.spinner("⚡ A processar a música inteira com IA em blocos otimizados... Por favor, aguarde."):
             try:
+                ai_model = get_basic_pitch_model()
+
                 with open(safe_input_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
 
@@ -83,7 +112,7 @@ if uploaded_file is not None:
                     chunk_file = session_dir / f"chunk_{chunk_idx}.wav"
                     sf.write(str(chunk_file), y_harm_chunk, sr, subtype='PCM_16')
 
-                    _, midi_data_chunk, _ = predict(str(chunk_file.resolve()), ICASSP_2022_MODEL_PATH)
+                    _, midi_data_chunk, _ = predict(str(chunk_file.resolve()), ai_model)
                     
                     for inst in midi_data_chunk.instruments:
                         for n in inst.notes:
@@ -175,35 +204,21 @@ if uploaded_file is not None:
                     tonica_map = {'C': 'Dó', 'C#': 'Dó#', 'D': 'Ré', 'E': 'Mi', 'F': 'Fá', 'G': 'Sol', 'A': 'Lá', 'B': 'Si'}
                     tonic_pt = tonica_map.get(detected_key.tonic.name.replace('-', ''), detected_key.tonic.name)
                     mode_pt = "Maior" if detected_key.mode == "major" else "Menor"
-                    
-                    st.success("✨ Partitura da música inteira gerada com sucesso!")
-                    st.info(f"🎵 Ritmo: {bpm} BPM | Compasso: {time_sig} | Tom: {tonic_pt} {mode_pt} | Clave de Sol")
 
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        with open(midi_path, "rb") as mf:
-                            st.download_button(
-                                label="📥 Baixar MIDI (.mid)",
-                                data=mf.read(),
-                                file_name="partitura_completa.mid",
-                                mime="audio/midi",
-                                use_container_width=True
-                            )
-                    with col2:
-                        with open(xml_path, "rb") as xf:
-                            st.download_button(
-                                label="🎼 Baixar Partitura (.musicxml)",
-                                data=xf.read(),
-                                file_name="partitura_clave_de_sol.musicxml",
-                                mime="application/vnd.recordare.musicxml+xml",
-                                use_container_width=True
-                            )
+                    # Lê os bytes em memória antes de limpar os arquivos do disco
+                    midi_bytes = midi_path.read_bytes()
+                    xml_bytes = xml_path.read_bytes()
 
                     try:
                         midi_path.unlink()
                         xml_path.unlink()
                     except Exception:
                         pass
+
+                    st.session_state["result_ready"] = True
+                    st.session_state["midi_bytes"] = midi_bytes
+                    st.session_state["xml_bytes"] = xml_bytes
+                    st.session_state["info_text"] = f"🎵 Ritmo: {bpm} BPM | Compasso: {time_sig} | Tom: {tonic_pt} {mode_pt} | Clave de Sol"
 
             except Exception as e:
                 st.error(f"Ocorreu um erro no processamento: {str(e)}")
@@ -215,3 +230,26 @@ if uploaded_file is not None:
                     try: shutil.rmtree(session_dir)
                     except Exception: pass
                 gc.collect()
+
+    # Exibe os resultados persistidos no session_state (permite baixar ambos sem perder a tela)
+    if st.session_state.get("result_ready"):
+        st.success("✨ Partitura da música inteira gerada com sucesso!")
+        st.info(st.session_state["info_text"])
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                label="📥 Baixar MIDI (.mid)",
+                data=st.session_state["midi_bytes"],
+                file_name="partitura_completa.mid",
+                mime="audio/midi",
+                use_container_width=True
+            )
+        with col2:
+            st.download_button(
+                label="🎼 Baixar Partitura (.musicxml)",
+                data=st.session_state["xml_bytes"],
+                file_name="partitura_clave_de_sol.musicxml",
+                mime="application/vnd.recordare.musicxml+xml",
+                use_container_width=True
+            )
