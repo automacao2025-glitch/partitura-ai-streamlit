@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 from collections import defaultdict
 
-# BLINDAGEM DEFINITIVA CONTRA ERRO DE PKG_RESOURCES NO PYTHON 3.11+
+# Blindagem contra erro de pkg_resources no Python 3.11+
 try:
     import pkg_resources
 except ImportError:
@@ -27,7 +27,6 @@ except ImportError:
 
 import streamlit as st
 
-# A configuração da página deve ser o primeiro comando Streamlit
 st.set_page_config(page_title="Partitura.ai", page_icon="🎵", layout="centered")
 
 import numpy as np
@@ -35,17 +34,23 @@ import librosa
 import soundfile as sf
 import pretty_midi
 import music21
+import pypdfium2 as pdfium
 from basic_pitch.inference import predict, Model
-from basic_pitch import ICASSP_2022_MODEL_PATH
+from basic_pitch import ICASSP_2022_MODEL_PATH, FilenameSuffix, build_icassp_2022_model_path
 
 UPLOAD_DIR = Path("temp_uploads")
 OUTPUT_DIR = Path("temp_outputs")
 for d in [UPLOAD_DIR, OUTPUT_DIR]:
     d.mkdir(exist_ok=True)
 
+# Carrega especificamente o modelo ONNX (ultra leve, rápido e sem erro de Protobuf/RAM)
 @st.cache_resource
 def get_basic_pitch_model():
-    return Model(ICASSP_2022_MODEL_PATH)
+    try:
+        onnx_path = build_icassp_2022_model_path(FilenameSuffix.onnx)
+        return Model(onnx_path)
+    except Exception:
+        return Model(ICASSP_2022_MODEL_PATH)
 
 class MockNote:
     def __init__(self, start, end, pitch, velocity):
@@ -56,7 +61,7 @@ class MockNote:
 
 st.title("🎵 Partitura.ai - Motor Universal")
 st.markdown("### Transcrição Musical Inteligente e Completa por IA")
-st.write("Selecione ou arraste um ficheiro de áudio (MP3, WAV, M4A, FLAC, OGG) para gerar a partitura completa e o ficheiro MIDI.")
+st.write("Selecione ou arraste um ficheiro de áudio (MP3, WAV, M4A, FLAC, OGG) para visualizar a partitura e baixar em **PDF**, **MusicXML** e **MIDI**.")
 
 uploaded_file = st.file_uploader("Escolha um ficheiro de áudio", type=["mp3", "wav", "m4a", "flac", "ogg"])
 
@@ -70,7 +75,7 @@ if uploaded_file is not None:
         session_dir = UPLOAD_DIR / f"session_{session_id}"
         session_dir.mkdir(exist_ok=True)
 
-        with st.spinner("⚡ A processar a música inteira com IA em blocos otimizados... Por favor, aguarde."):
+        with st.spinner("⚡ A processar a música inteira com IA e a desenhar a partitura... Por favor, aguarde."):
             try:
                 ai_model = get_basic_pitch_model()
 
@@ -150,7 +155,7 @@ if uploaded_file is not None:
                                 n.end = n.start + grid_step
                             processed_notes.append(n)
 
-                    # Salva ficheiro MIDI
+                    # 1. Gera ficheiro MIDI
                     midi_path = OUTPUT_DIR / f"partitura_{session_id}.mid"
                     pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
                     inst = pretty_midi.Instrument(program=0)
@@ -159,13 +164,18 @@ if uploaded_file is not None:
                     pm.instruments.append(inst)
                     pm.write(str(midi_path))
 
-                    # Construção da partitura estruturada com music21
+                    # 2. Construção da partitura estruturada com music21
                     clusters_by_ql = defaultdict(list)
                     for n in processed_notes:
                         start_ql = round((n.start / sec_per_quarter) * 4) / 4.0
                         clusters_by_ql[start_ql].append(n)
 
                     sorted_offsets = sorted(clusters_by_ql.keys())
+                    score = music21.stream.Score()
+                    score.insert(0, music21.metadata.Metadata())
+                    score.metadata.title = os.path.splitext(uploaded_file.name)[0]
+                    score.metadata.composer = "Transcrito por Partitura.ai"
+
                     part = music21.stream.Part()
                     part.insert(0, music21.clef.TrebleClef())
                     part.insert(0, music21.meter.TimeSignature(time_sig))
@@ -195,29 +205,48 @@ if uploaded_file is not None:
                     ks = music21.analysis.discrete.KrumhanslSchmuckler()
                     detected_key = ks.getSolution(part)
                     part.insert(0, music21.key.KeySignature(detected_key.sharps))
-
-                    # Gera ficheiro MusicXML (Partitura editável)
-                    xml_path = OUTPUT_DIR / f"partitura_{session_id}.musicxml"
                     part.makeMeasures(inPlace=True)
-                    part.write('musicxml', fp=str(xml_path))
+                    score.insert(0, part)
+
+                    # Salva ficheiro MusicXML
+                    xml_path = OUTPUT_DIR / f"partitura_{session_id}.musicxml"
+                    score.write('musicxml', fp=str(xml_path))
+
+                    # 3. Gera PDF e Imagens da Partitura via LilyPond + pypdfium2
+                    pdf_bytes = None
+                    page_images = []
+                    try:
+                        ly_base = OUTPUT_DIR / f"partitura_{session_id}"
+                        generated_pdf = Path(score.write('lily.pdf', fp=str(ly_base)))
+                        if generated_pdf.exists():
+                            pdf_bytes = generated_pdf.read_bytes()
+                            pdf_doc = pdfium.PdfDocument(pdf_bytes)
+                            for i in range(len(pdf_doc)):
+                                page = pdf_doc[i]
+                                pil_image = page.render(scale=2).to_pil()
+                                page_images.append(pil_image)
+                            generated_pdf.unlink(missing_ok=True)
+                        for f in OUTPUT_DIR.glob(f"partitura_{session_id}*"):
+                            if f.suffix not in ['.mid', '.musicxml']:
+                                f.unlink(missing_ok=True)
+                    except Exception as pdf_err:
+                        st.warning(f"Aviso na geração visual do PDF: {pdf_err}")
 
                     tonica_map = {'C': 'Dó', 'C#': 'Dó#', 'D': 'Ré', 'E': 'Mi', 'F': 'Fá', 'G': 'Sol', 'A': 'Lá', 'B': 'Si'}
                     tonic_pt = tonica_map.get(detected_key.tonic.name.replace('-', ''), detected_key.tonic.name)
                     mode_pt = "Maior" if detected_key.mode == "major" else "Menor"
 
-                    # Lê os bytes em memória antes de limpar os arquivos do disco
                     midi_bytes = midi_path.read_bytes()
                     xml_bytes = xml_path.read_bytes()
 
-                    try:
-                        midi_path.unlink()
-                        xml_path.unlink()
-                    except Exception:
-                        pass
+                    midi_path.unlink(missing_ok=True)
+                    xml_path.unlink(missing_ok=True)
 
                     st.session_state["result_ready"] = True
                     st.session_state["midi_bytes"] = midi_bytes
                     st.session_state["xml_bytes"] = xml_bytes
+                    st.session_state["pdf_bytes"] = pdf_bytes
+                    st.session_state["page_images"] = page_images
                     st.session_state["info_text"] = f"🎵 Ritmo: {bpm} BPM | Compasso: {time_sig} | Tom: {tonic_pt} {mode_pt} | Clave de Sol"
 
             except Exception as e:
@@ -231,13 +260,29 @@ if uploaded_file is not None:
                     except Exception: pass
                 gc.collect()
 
-    # Exibe os resultados persistidos no session_state (permite baixar ambos sem perder a tela)
     if st.session_state.get("result_ready"):
         st.success("✨ Partitura da música inteira gerada com sucesso!")
         st.info(st.session_state["info_text"])
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
+            if st.session_state.get("pdf_bytes"):
+                st.download_button(
+                    label="📄 Baixar PDF (.pdf)",
+                    data=st.session_state["pdf_bytes"],
+                    file_name="partitura_clave_de_sol.pdf",
+                    mime="application/pdf",
+                    use_container_width=True
+                )
+        with col2:
+            st.download_button(
+                label="🎼 Baixar MusicXML",
+                data=st.session_state["xml_bytes"],
+                file_name="partitura_clave_de_sol.musicxml",
+                mime="application/vnd.recordare.musicxml+xml",
+                use_container_width=True
+            )
+        with col3:
             st.download_button(
                 label="📥 Baixar MIDI (.mid)",
                 data=st.session_state["midi_bytes"],
@@ -245,11 +290,8 @@ if uploaded_file is not None:
                 mime="audio/midi",
                 use_container_width=True
             )
-        with col2:
-            st.download_button(
-                label="🎼 Baixar Partitura (.musicxml)",
-                data=st.session_state["xml_bytes"],
-                file_name="partitura_clave_de_sol.musicxml",
-                mime="application/vnd.recordare.musicxml+xml",
-                use_container_width=True
-            )
+
+        if st.session_state.get("page_images"):
+            st.markdown("### 🎼 Visualização da Partitura")
+            for idx, img in enumerate(st.session_state["page_images"]):
+                st.image(img, caption=f"Página {idx + 1}", use_container_width=True)
