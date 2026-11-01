@@ -1,0 +1,10 @@
+streamlit==1.32.0
+numpy==1.26.4
+scipy==1.11.4
+scikit-learn==1.4.2
+soundfile==0.12.1
+librosa==0.10.1
+music21==9.1.0
+basic-pitch==0.4.0
+tensorflow-cpu==2.15.0
+pretty-midi==0.2.10
