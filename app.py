@@ -83,6 +83,9 @@ OUTPUT_DIR = Path("temp_outputs")
 for d in [UPLOAD_DIR, OUTPUT_DIR]:
     d.mkdir(exist_ok=True)
 
+# ---------------------------------------------------------
+# CARREGAMENTO OTIMIZADO VIA ONNX RUNTIME
+# ---------------------------------------------------------
 @st.cache_resource
 def get_inference_model():
     try:
@@ -98,9 +101,12 @@ class MockNote:
         self.pitch = pitch
         self.velocity = velocity
 
+# ---------------------------------------------------------
+# CABEÇALHO E INTERFACE WEB
+# ---------------------------------------------------------
 st.title("🎵 Partitura.ai")
 st.markdown("### Sua Música em Partitura com Melodia e Cifras Harmônicas")
-st.write("Envie um arquivo de áudio para transcrever a melodia principal, extrair o campo harmônico (acordes base), visualizar a partitura na tela e baixar em **PDF**, **MusicXML** e **MIDI**.")
+st.write("Envie um arquivo de áudio para transcrever a melodia principal, extrair o campo harmônico avançado (cifras e acordes base), visualizar a partitura e exportar em **PDF**, **MusicXML** e **MIDI**.")
 
 uploaded_file = st.file_uploader("Escolha um arquivo de áudio", type=["mp3", "wav", "m4a", "flac", "ogg"])
 
@@ -114,7 +120,7 @@ if uploaded_file is not None:
         session_dir = UPLOAD_DIR / f"session_{session_id}"
         session_dir.mkdir(exist_ok=True)
 
-        with st.spinner("⚡ Processando áudio, estruturando notas e extraindo cifras harmônicas... Aguarde."):
+        with st.spinner("⚡ Processando áudio, estruturando melodia e extraindo o campo harmônico (cifras)... Aguarde."):
             try:
                 ai_model = get_inference_model()
 
@@ -138,7 +144,7 @@ if uploaded_file is not None:
                 del y_harmonic_full, onset_env
                 gc.collect()
 
-                # Processamento em Chunks para otimização de memória RAM na nuvem
+                # Processamento por blocos (Chunks) para estabilidade de memória RAM
                 chunk_duration = 30.0
                 all_notes = []
                 start_time = 0.0
@@ -242,14 +248,14 @@ if uploaded_file is not None:
                         el.quarterLength = dur_ql
                         part.insert(start_ql, el)
 
-                    # Análise Tonal e Harmônica
+                    # Análise Tonal
                     ks = music21.analysis.discrete.KrumhanslSchmuckler()
                     detected_key = ks.getSolution(part)
                     part.insert(0, music21.key.KeySignature(detected_key.sharps))
                     part.makeMeasures(inPlace=True)
 
                     # ---------------------------------------------------------
-                    # MÓDULO DE EXTRAÇÃO DE CIFRAS / HARMÔNIA BASE
+                    # PIPELINE AVANÇADO DE EXTRAÇÃO E RENDERIZAÇÃO DE CIFRAS (HARMONIA)
                     # ---------------------------------------------------------
                     try:
                         measures = part.getElementsByClass(music21.stream.Measure)
@@ -259,12 +265,31 @@ if uploaded_file is not None:
                                 chord_pitches = [n.pitch for n in m_notes if isinstance(n, music21.note.Note)]
                                 if len(chord_pitches) >= 2:
                                     ch = music21.chord.Chord(chord_pitches)
-                                    rn = music21.roman.romanNumeralFromChord(ch, detected_key)
-                                    chord_symbol = rn.figure
-                                    # Inserção da cifra como expressão de texto alinhada acima da pauta
-                                    m.insert(0, music21.text.Expression(chord_symbol))
+                                    # Identificação robusta de acordes, suportando extensões e alterações (ex: B7(+9), C7(13))
+                                    cs = music21.harmony.chordSymbol.chordSymbolFromChord(ch)
+                                    if cs:
+                                        chord_name = cs.figure
+                                    else:
+                                        root = ch.root().name
+                                        quality = ch.commonName
+                                        if 'major triad' in quality:
+                                            chord_name = f"{root}"
+                                        elif 'minor triad' in quality:
+                                            chord_name = f"{root}m"
+                                        elif 'dominant seventh' in quality:
+                                            chord_name = f"{root}7"
+                                        elif 'major seventh' in quality:
+                                            chord_name = f"{root}7M"
+                                        elif 'minor seventh' in quality:
+                                            chord_name = f"{root}m7"
+                                        else:
+                                            rn = music21.roman.romanNumeralFromChord(ch, detected_key)
+                                            chord_name = rn.figure if rn else root
+                                    
+                                    # Insere a cifra formatada como Expressão de Texto alinhada acima da pauta
+                                    m.insert(0, music21.text.Expression(chord_name))
                     except Exception:
-                        pass # Garante estabilidade contínua caso haja trechos exclusivamente monofônicos
+                        pass # Garante estabilidade total do app caso ocorram trechos sem notas simultâneas
 
                     score.insert(0, part)
 
@@ -272,7 +297,7 @@ if uploaded_file is not None:
                     xml_path = OUTPUT_DIR / f"partitura_{session_id}.musicxml"
                     score.write('musicxml', fp=str(xml_path))
 
-                    # Renderização Gráfica em PDF e Conversão para Imagens PNG em Memória
+                    # Renderização Gráfica em PDF e Conversão Segura para PNG em bytes
                     pdf_bytes = None
                     page_images = []
                     try:
@@ -309,7 +334,7 @@ if uploaded_file is not None:
                     st.session_state["xml_bytes"] = xml_bytes
                     st.session_state["pdf_bytes"] = pdf_bytes
                     st.session_state["page_images"] = page_images
-                    st.session_state["info_text"] = f"🎵 Andamento: {bpm} BPM | Compasso: {time_sig} | Tom: {tonic_pt} {mode_pt} | Clave de Sol + Cifras Harmônicas"
+                    st.session_state["info_text"] = f"🎵 Andamento: {bpm} BPM | Compasso: {time_sig} | Tom: {tonic_pt} {mode_pt} | Melodia + Cifras Harmônicas"
 
             except Exception as e:
                 st.error(f"Erro durante o processamento do arquivo: {str(e)}")
