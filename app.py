@@ -6,7 +6,9 @@ import shutil
 from pathlib import Path
 from collections import defaultdict
 
-# Blindagem contra erro de pkg_resources no Python 3.11+
+# ---------------------------------------------------------
+# SHIM DE COMPATIBILIDADE: pkg_resources no Python 3.11+
+# ---------------------------------------------------------
 try:
     import pkg_resources
 except ImportError:
@@ -43,12 +45,14 @@ OUTPUT_DIR = Path("temp_outputs")
 for d in [UPLOAD_DIR, OUTPUT_DIR]:
     d.mkdir(exist_ok=True)
 
-# Carrega especificamente o modelo ONNX (ultra leve, rápido e sem erro de Protobuf/RAM)
+# ---------------------------------------------------------
+# CARREGAMENTO VIA ONNX RUNTIME (Rápido, leve, sem TensorFlow)
+# ---------------------------------------------------------
 @st.cache_resource
-def get_basic_pitch_model():
+def get_inference_model():
     try:
-        onnx_path = build_icassp_2022_model_path(FilenameSuffix.onnx)
-        return Model(onnx_path)
+        onnx_model_path = build_icassp_2022_model_path(FilenameSuffix.onnx)
+        return Model(onnx_model_path)
     except Exception:
         return Model(ICASSP_2022_MODEL_PATH)
 
@@ -61,7 +65,7 @@ class MockNote:
 
 st.title("🎵 Partitura.ai - Motor Universal")
 st.markdown("### Transcrição Musical Inteligente e Completa por IA")
-st.write("Selecione ou arraste um ficheiro de áudio (MP3, WAV, M4A, FLAC, OGG) para visualizar a partitura e baixar em **PDF**, **MusicXML** e **MIDI**.")
+st.write("Envie um ficheiro de áudio para transcrever a melodia, visualizar a partitura na tela e exportar em **PDF**, **MusicXML** e **MIDI**.")
 
 uploaded_file = st.file_uploader("Escolha um ficheiro de áudio", type=["mp3", "wav", "m4a", "flac", "ogg"])
 
@@ -75,9 +79,9 @@ if uploaded_file is not None:
         session_dir = UPLOAD_DIR / f"session_{session_id}"
         session_dir.mkdir(exist_ok=True)
 
-        with st.spinner("⚡ A processar a música inteira com IA e a desenhar a partitura... Por favor, aguarde."):
+        with st.spinner("⚡ A transcrever áudio com IA e a compor a partitura... Por favor, aguarde."):
             try:
-                ai_model = get_basic_pitch_model()
+                ai_model = get_inference_model()
 
                 with open(safe_input_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
@@ -85,7 +89,7 @@ if uploaded_file is not None:
                 y_full, sr = librosa.load(str(safe_input_path), sr=22050, mono=True)
                 total_duration = len(y_full) / sr
 
-                # Deteção global de BPM
+                # Estimativa de Andamento (BPM)
                 y_harmonic_full, _ = librosa.effects.hpss(y_full)
                 onset_env = librosa.onset.onset_strength(y=y_harmonic_full, sr=sr)
                 tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
@@ -99,6 +103,7 @@ if uploaded_file is not None:
                 del y_harmonic_full, onset_env
                 gc.collect()
 
+                # Processamento em Chunks para estabilidade de memória
                 chunk_duration = 30.0
                 all_notes = []
                 start_time = 0.0
@@ -137,7 +142,7 @@ if uploaded_file is not None:
                 gc.collect()
 
                 if not all_notes:
-                    st.error("Nenhuma nota musical clara detetada neste áudio.")
+                    st.error("Nenhuma nota musical clara foi detetada neste áudio.")
                 else:
                     sec_per_quarter = 60.0 / bpm
                     beats_per_bar = int(time_sig.split("/")[0])
@@ -155,7 +160,7 @@ if uploaded_file is not None:
                                 n.end = n.start + grid_step
                             processed_notes.append(n)
 
-                    # 1. Gera ficheiro MIDI
+                    # Exportação MIDI
                     midi_path = OUTPUT_DIR / f"partitura_{session_id}.mid"
                     pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
                     inst = pretty_midi.Instrument(program=0)
@@ -164,7 +169,7 @@ if uploaded_file is not None:
                     pm.instruments.append(inst)
                     pm.write(str(midi_path))
 
-                    # 2. Construção da partitura estruturada com music21
+                    # Construção da Estrutura Musical via music21
                     clusters_by_ql = defaultdict(list)
                     for n in processed_notes:
                         start_ql = round((n.start / sec_per_quarter) * 4) / 4.0
@@ -208,11 +213,11 @@ if uploaded_file is not None:
                     part.makeMeasures(inPlace=True)
                     score.insert(0, part)
 
-                    # Salva ficheiro MusicXML
+                    # Exportação MusicXML
                     xml_path = OUTPUT_DIR / f"partitura_{session_id}.musicxml"
                     score.write('musicxml', fp=str(xml_path))
 
-                    # 3. Gera PDF e Imagens da Partitura via LilyPond + pypdfium2
+                    # Renderização gráfica em PDF e Imagens de Página
                     pdf_bytes = None
                     page_images = []
                     try:
@@ -230,7 +235,7 @@ if uploaded_file is not None:
                             if f.suffix not in ['.mid', '.musicxml']:
                                 f.unlink(missing_ok=True)
                     except Exception as pdf_err:
-                        st.warning(f"Aviso na geração visual do PDF: {pdf_err}")
+                        st.warning(f"Nota da renderização do PDF: {pdf_err}")
 
                     tonica_map = {'C': 'Dó', 'C#': 'Dó#', 'D': 'Ré', 'E': 'Mi', 'F': 'Fá', 'G': 'Sol', 'A': 'Lá', 'B': 'Si'}
                     tonic_pt = tonica_map.get(detected_key.tonic.name.replace('-', ''), detected_key.tonic.name)
@@ -250,7 +255,7 @@ if uploaded_file is not None:
                     st.session_state["info_text"] = f"🎵 Ritmo: {bpm} BPM | Compasso: {time_sig} | Tom: {tonic_pt} {mode_pt} | Clave de Sol"
 
             except Exception as e:
-                st.error(f"Ocorreu um erro no processamento: {str(e)}")
+                st.error(f"Erro durante o processamento: {str(e)}")
             finally:
                 if safe_input_path.exists():
                     try: safe_input_path.unlink()
@@ -261,7 +266,7 @@ if uploaded_file is not None:
                 gc.collect()
 
     if st.session_state.get("result_ready"):
-        st.success("✨ Partitura da música inteira gerada com sucesso!")
+        st.success("✨ Transcrição concluída com sucesso!")
         st.info(st.session_state["info_text"])
 
         col1, col2, col3 = st.columns(3)
@@ -292,6 +297,6 @@ if uploaded_file is not None:
             )
 
         if st.session_state.get("page_images"):
-            st.markdown("### 🎼 Visualização da Partitura")
+            st.markdown("### 🎼 Partitura Gerada")
             for idx, img in enumerate(st.session_state["page_images"]):
                 st.image(img, caption=f"Página {idx + 1}", use_container_width=True)
