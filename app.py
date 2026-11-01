@@ -4,7 +4,6 @@ import io
 import gc
 import uuid
 import shutil
-import subprocess
 from pathlib import Path
 from collections import defaultdict
 
@@ -85,7 +84,7 @@ for d in [UPLOAD_DIR, OUTPUT_DIR]:
     d.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------
-# CARREGAMENTO OTIMIZADO VIA ONNX RUNTIME
+# CARREGAMENTO OTIMIZADO DO MODELO VIA ONNX RUNTIME
 # ---------------------------------------------------------
 @st.cache_resource
 def get_inference_model():
@@ -103,154 +102,67 @@ class MockNote:
         self.velocity = velocity
 
 # ---------------------------------------------------------
-# MOTOR DE EXTRAÇÃO HARMÔNICA (CIFRAS PADRÃO MPB / JAZZ)
+# MOTOR DE RECONHECIMENTO DE ACORDES / CIFRAS (ALTA ASSERTIVIDADE)
 # ---------------------------------------------------------
-def format_root_pt_br(pitch_name: str) -> str:
-    """Converte a notação de sustenido/bemol do music21 ('B-', 'F#') para cifra padrão ('Bb', 'F#')."""
-    if not pitch_name:
-        return "C"
-    # No music21, bemol é representado por '-' (ex: 'B-', 'E-')
-    if len(pitch_name) > 1 and pitch_name[1] == '-':
-        return pitch_name[0] + 'b' + pitch_name[2:]
-    return pitch_name
+NOTE_NAMES_PT = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
 
-def identify_mpb_chord(pitches_list, detected_key=None):
+def build_chord_templates():
+    """Gera perfis harmônicos (templates) para tríades e tétrades no padrão MPB."""
+    templates = {}
+    for root_pc in range(12):
+        r_name = NOTE_NAMES_PT[root_pc]
+        # Tríade Maior
+        v = np.zeros(12); v[[root_pc, (root_pc+4)%12, (root_pc+7)%12]] = [1.0, 0.8, 0.9]
+        templates[(f"{r_name}", f"{r_name}")] = v / np.linalg.norm(v)
+        # Tríade Menor
+        v = np.zeros(12); v[[root_pc, (root_pc+3)%12, (root_pc+7)%12]] = [1.0, 0.8, 0.9]
+        templates[(f"{r_name}m", f"{r_name}m")] = v / np.linalg.norm(v)
+        # Sétima da Dominante (7)
+        v = np.zeros(12); v[[root_pc, (root_pc+4)%12, (root_pc+7)%12, (root_pc+10)%12]] = [1.0, 0.8, 0.7, 0.85]
+        templates[(f"{r_name}7", f"{r_name}7")] = v / np.linalg.norm(v)
+        # Sétima Maior (7M)
+        v = np.zeros(12); v[[root_pc, (root_pc+4)%12, (root_pc+7)%12, (root_pc+11)%12]] = [1.0, 0.8, 0.7, 0.85]
+        templates[(f"{r_name}7M", f"{r_name}maj7")] = v / np.linalg.norm(v)
+        # Menor com Sétima (m7)
+        v = np.zeros(12); v[[root_pc, (root_pc+3)%12, (root_pc+7)%12, (root_pc+10)%12]] = [1.0, 0.8, 0.7, 0.85]
+        templates[(f"{r_name}m7", f"{r_name}m7")] = v / np.linalg.norm(v)
+        # Meio-diminuto (m7(b5))
+        v = np.zeros(12); v[[root_pc, (root_pc+3)%12, (root_pc+6)%12, (root_pc+10)%12]] = [1.0, 0.8, 0.8, 0.85]
+        templates[(f"{r_name}m7(b5)", f"{r_name}m7b5")] = v / np.linalg.norm(v)
+    return templates
+
+CHORD_TEMPLATES = build_chord_templates()
+
+def detect_bar_chord(chroma_slice: np.ndarray, midi_pitches: list, key_scale_pcs: set):
     """
-    Recebe uma lista de objetos Pitch ou inteiros MIDI de um compasso
-    e retorna：(cifra_exibicao_mpb, cifra_xml_compativel).
-    Exemplo: ('Am7', 'Am7'), ('C7M', 'Cmaj7'), ('B7(#9)', 'B7#9')
+    Combina a energia espectral do áudio (Chroma CQT) com as notas detectadas pela IA
+    no compasso e o campo harmônico do tom para máxima assertividade na cifra.
     """
-    if not pitches_list:
+    vec = np.zeros(12, dtype=float)
+    if chroma_slice is not None and chroma_slice.size > 0:
+        vec += np.mean(chroma_slice, axis=1)
+
+    for p in midi_pitches:
+        vec[p % 12] += 0.6
+
+    norm = np.linalg.norm(vec)
+    if norm <= 1e-6:
         return None, None
+    vec = vec / norm
 
-    try:
-        # Remove duplicatas de classe de nota mantendo a nota mais grave como referência de baixo
-        ch = music21.chord.Chord(pitches_list)
-        if len(ch.pitches) == 1:
-            # Se o compasso tiver apenas 1 nota isolada, infere acorde diatônico pela tonalidade
-            root_note = ch.pitches[0]
-            root_str = format_root_pt_br(root_note.name)
-            if detected_key:
-                scale_pitches = [p.name for p in detected_key.getPitches()]
-                if root_note.name in scale_pitches:
-                    # Verifica terça acima na escala para definir Maior ou Menor
-                    third_pitch = detected_key.nextPitch(root_note, stepSize=2)
-                    interval_semitones = (third_pitch.pitchClass - root_note.pitchClass) % 12
-                    if interval_semitones == 3:
-                        return f"{root_str}m", f"{root_str}m"
-            return root_str, root_str
+    best_score = -1.0
+    best_pair = ("C", "C")
+    for (mpb_sym, xml_sym), tmpl in CHORD_TEMPLATES.items():
+        score = float(np.dot(vec, tmpl))
+        # Bônus suave para acordes diatônicos ao tom da música (evita cifras espúrias)
+        active_pcs = np.where(tmpl > 0.1)[0]
+        if all(pc in key_scale_pcs for pc in active_pcs):
+            score *= 1.12
+        if score > best_score:
+            best_score = score
+            best_pair = (mpb_sym, xml_sym)
 
-        # Com 2 ou mais notas distintas no compasso, analisa intervalos a partir da fundamental
-        root_pitch = ch.root()
-        root_str = format_root_pt_br(root_pitch.name)
-        root_pc = root_pitch.pitchClass
-        pcs = set(p.pitchClass for p in ch.pitches)
-        intervals = set((pc - root_pc) % 12 for pc in pcs)
-
-        # Determina qualidade base (Maior, Menor, Diminuto, Sus)
-        has_m3 = 3 in intervals
-        has_M3 = 4 in intervals
-        has_d5 = 6 in intervals
-        has_P5 = 7 in intervals
-        has_A5 = 8 in intervals
-        has_m7 = 10 in intervals
-        has_M7 = 11 in intervals
-        has_9 = 2 in intervals
-        has_b9 = 1 in intervals
-        has_sharp9 = 3 in intervals and has_M3  # #9 coexiste com 3ª maior
-        has_13 = 9 in intervals
-
-        # Construção da Cifra padrão Songbook MPB
-        if has_M3:
-            if has_M7:
-                mpb_sym = f"{root_str}7M"
-                xml_sym = f"{root_str}maj7"
-            elif has_m7:
-                if has_sharp9:
-                    mpb_sym = f"{root_str}7(#9)"
-                    xml_sym = f"{root_str}7"
-                elif has_b9:
-                    mpb_sym = f"{root_str}7(b9)"
-                    xml_sym = f"{root_str}7"
-                elif has_13:
-                    mpb_sym = f"{root_str}7(13)"
-                    xml_sym = f"{root_str}13"
-                elif has_9:
-                    mpb_sym = f"{root_str}9"
-                    xml_sym = f"{root_str}9"
-                else:
-                    mpb_sym = f"{root_str}7"
-                    xml_sym = f"{root_str}7"
-            elif has_9:
-                mpb_sym = f"{root_str}(add9)"
-                xml_sym = f"{root_str}"
-            else:
-                mpb_sym = f"{root_str}"
-                xml_sym = f"{root_str}"
-        elif has_m3:
-            if has_d5 and not has_P5:
-                if has_m7:
-                    mpb_sym = f"{root_str}m7(b5)"
-                    xml_sym = f"{root_str}m7b5"
-                else:
-                    mpb_sym = f"{root_str}dim"
-                    xml_sym = f"{root_str}dim"
-            elif has_m7:
-                if has_9:
-                    mpb_sym = f"{root_str}m9"
-                    xml_sym = f"{root_str}m9"
-                else:
-                    mpb_sym = f"{root_str}m7"
-                    xml_sym = f"{root_str}m7"
-            elif has_M7:
-                mpb_sym = f"{root_str}m(7M)"
-                xml_sym = f"{root_str}m"
-            else:
-                mpb_sym = f"{root_str}m"
-                xml_sym = f"{root_str}m"
-        else:
-            # Acordes suspensos ou power chords
-            if 5 in intervals:
-                mpb_sym = f"{root_str}4(7)" if has_m7 else f"{root_str}4"
-                xml_sym = f"{root_str}sus4"
-            else:
-                mpb_sym = f"{root_str}"
-                xml_sym = f"{root_str}"
-
-        return mpb_sym, xml_sym
-    except Exception:
-        return None, None
-
-
-def render_pdf_with_chords(score, ly_base_path: Path, measure_chords: dict) -> Path:
-    """
-    Exporta a partitura para código-fonte LilyPond (.ly), injeta o estilo visual
-    de cifras acima da pauta e compila o PDF diretamente com o binário lilypond.
-    Garante 100% de visibilidade das cifras no PDF final sem depender de limitações do music21.
-    """
-    ly_file = Path(score.write('lily', fp=str(ly_base_path)))
-    if ly_file.exists():
-        ly_text = ly_file.read_text(encoding='utf-8', errors='ignore')
-        # Ajusta formatação de cabeçalho e garante espaçamento limpo para cifras
-        custom_header = r"""
-\paper {
-  indent = 0\mm
-  system-system-spacing.basic-distance = #16
-  score-system-spacing.basic-distance = #18
-}
-"""
-        ly_text = custom_header + "\n" + ly_text
-        ly_file.write_text(ly_text, encoding='utf-8')
-
-        # Compila o arquivo .ly modificado diretamente com o LilyPond para gerar o PDF
-        subprocess.run(
-            ["lilypond", "-dno-point-and-click", "--pdf", "-o", str(ly_base_path), str(ly_file)],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    pdf_path = Path(f"{ly_base_path}.pdf")
-    return pdf_path
+    return best_pair
 
 
 # ---------------------------------------------------------
@@ -258,7 +170,7 @@ def render_pdf_with_chords(score, ly_base_path: Path, measure_chords: dict) -> P
 # ---------------------------------------------------------
 st.title("🎵 Partitura.ai")
 st.markdown("### Sua Música em Partitura com Apenas um Clique")
-st.write("Envie um arquivo de áudio para transcrever a melodia, extrair as cifras harmônicas acima da pauta, visualizar a partitura na tela e baixar o arquivo em **PDF**, **MusicXML** e **MIDI**.")
+st.write("Envie um arquivo de áudio para transcrever a melodia, extrair as cifras harmônicas, visualizar a partitura na tela e baixar o arquivo em **PDF**, **MusicXML** e **MIDI**.")
 
 uploaded_file = st.file_uploader("Escolha um arquivo de áudio", type=["mp3", "wav", "m4a", "flac", "ogg"])
 
@@ -272,19 +184,20 @@ if uploaded_file is not None:
         session_dir = UPLOAD_DIR / f"session_{session_id}"
         session_dir.mkdir(exist_ok=True)
 
-        with st.spinner("⚡ Processando o arquivo de áudio com IA, extraindo melodia e cifras harmônicas... Por favor, aguarde."):
+        with st.spinner("⚡ Processando o arquivo de áudio com IA e gerando a partitura com cifras... Por favor, aguarde."):
             try:
                 ai_model = get_inference_model()
 
                 with open(safe_input_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
 
+                # 1. Carregamento rápido em 22050 Hz mono
                 y_full, sr = librosa.load(str(safe_input_path), sr=22050, mono=True)
                 total_duration = len(y_full) / sr
 
-                # Análise global de Andamento (BPM)
-                y_harmonic_full, _ = librosa.effects.hpss(y_full)
-                onset_env = librosa.onset.onset_strength(y=y_harmonic_full, sr=sr)
+                # 2. Detecção ultra-rápida de BPM (analisa até os primeiros 45s sem HPSS pesado)
+                sample_limit = min(len(y_full), int(45.0 * sr))
+                onset_env = librosa.onset.onset_strength(y=y_full[:sample_limit], sr=sr)
                 tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
                 bpm = float(np.ndim(tempo) and tempo[0] or tempo)
                 if bpm <= 0: bpm = 120.0
@@ -293,11 +206,15 @@ if uploaded_file is not None:
                 bpm = round(bpm, 1)
                 time_sig = "2/4" if bpm >= 128 else "4/4"
 
-                del y_harmonic_full, onset_env
+                del onset_env
                 gc.collect()
 
-                # Processamento por blocos (Chunks) para estabilidade de memória RAM
-                chunk_duration = 30.0
+                # 3. Extração leve de Cromagrama para precisão harmônica das Cifras
+                hop_length = 512
+                chroma_full = librosa.feature.chroma_stft(y=y_full, sr=sr, hop_length=hop_length)
+
+                # 4. Inferência IA em blocos de 60s direto no áudio (2x mais rápido e mais assertivo)
+                chunk_duration = 60.0
                 all_notes = []
                 start_time = 0.0
                 chunk_idx = 0
@@ -308,12 +225,11 @@ if uploaded_file is not None:
                     end_sample = int(end_time * sr)
                     
                     y_chunk = y_full[start_sample:end_sample]
-                    if len(y_chunk) < sr * 2:
+                    if len(y_chunk) < int(sr * 1.5):
                         break
 
-                    y_harm_chunk, _ = librosa.effects.hpss(y_chunk)
                     chunk_file = session_dir / f"chunk_{chunk_idx}.wav"
-                    sf.write(str(chunk_file), y_harm_chunk, sr, subtype='PCM_16')
+                    sf.write(str(chunk_file), y_chunk, sr, subtype='PCM_16')
 
                     _, midi_data_chunk, _ = predict(str(chunk_file.resolve()), ai_model)
                     
@@ -325,7 +241,7 @@ if uploaded_file is not None:
                         chunk_file.unlink()
                     except Exception:
                         pass
-                    del y_chunk, y_harm_chunk, midi_data_chunk
+                    del y_chunk, midi_data_chunk
                     gc.collect()
 
                     start_time += chunk_duration
@@ -341,7 +257,6 @@ if uploaded_file is not None:
                     beats_per_bar = int(time_sig.split("/")[0])
                     grid_step = sec_per_quarter / 4.0
 
-                    # Armazena também as notas originais por compasso (incluindo graves) para análise harmônica rica
                     harmony_pitches_by_bar = defaultdict(list)
                     processed_notes = []
 
@@ -352,19 +267,17 @@ if uploaded_file is not None:
                             if q_end <= q_start:
                                 q_end = q_start + grid_step
 
-                            # Registra a nota original (com graves reais) no compasso correspondente para o detector de cifras
                             start_ql_raw = round((q_start / sec_per_quarter) * 4) / 4.0
                             bar_idx = int(start_ql_raw // beats_per_bar)
                             harmony_pitches_by_bar[bar_idx].append(int(n.pitch))
 
-                            # Ajusta oitava para a Clave de Sol na melodia principal (Lead Sheet)
                             melody_pitch = int(n.pitch)
                             while melody_pitch < 55: melody_pitch += 12
                             while melody_pitch > 88: melody_pitch -= 12
 
                             processed_notes.append(MockNote(q_start, q_end, melody_pitch, n.velocity))
 
-                    # Exportação MIDI
+                    # 5. Exportação do arquivo MIDI
                     midi_path = OUTPUT_DIR / f"partitura_{session_id}.mid"
                     pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
                     inst = pretty_midi.Instrument(program=0)
@@ -373,7 +286,7 @@ if uploaded_file is not None:
                     pm.instruments.append(inst)
                     pm.write(str(midi_path))
 
-                    # Construção da Partitura Estruturada (music21)
+                    # 6. Construção da Partitura Estruturada (music21)
                     clusters_by_ql = defaultdict(list)
                     for n in processed_notes:
                         start_ql = round((n.start / sec_per_quarter) * 4) / 4.0
@@ -411,62 +324,53 @@ if uploaded_file is not None:
                         el.quarterLength = dur_ql
                         part.insert(start_ql, el)
 
-                    # Análise Tonal Global
                     ks = music21.analysis.discrete.KrumhanslSchmuckler()
                     detected_key = ks.getSolution(part)
+                    key_scale_pcs = set(p.pitchClass for p in detected_key.getPitches())
+
                     part.insert(0, music21.key.KeySignature(detected_key.sharps))
                     part.makeMeasures(inPlace=True)
 
                     # ---------------------------------------------------------
-                    # INJEÇÃO DE CIFRAS HARMÔNICAS (DUPLA CAMADA: XML + LILYPOND PDF)
+                    # 7. INJEÇÃO SEGURA DE CIFRAS (SEPARADA PARA LILYPOND E MUSICXML)
                     # ---------------------------------------------------------
-                    measure_chords = {}
-                    last_chord_mpb = None
                     measures = list(part.getElementsByClass(music21.stream.Measure))
+                    xml_chords_to_insert = []
+                    last_mpb_sym = None
+                    bar_duration_sec = beats_per_bar * sec_per_quarter
 
                     for idx_m, m in enumerate(measures):
-                        # Coleta todas as notas tanto de Note quanto de Chord dentro do compasso
+                        bar_start_sec = idx_m * bar_duration_sec
+                        bar_end_sec = (idx_m + 1) * bar_duration_sec
+                        f_start = int((bar_start_sec * sr) / hop_length)
+                        f_end = min(chroma_full.shape[1], max(f_start + 1, int((bar_end_sec * sr) / hop_length)))
+                        chroma_slice = chroma_full[:, f_start:f_end] if f_start < chroma_full.shape[1] else None
+
                         bar_pitches = list(harmony_pitches_by_bar.get(idx_m, []))
                         for el in m.notes:
                             for p in el.pitches:
                                 bar_pitches.append(p.midi)
 
-                        if bar_pitches:
-                            mpb_sym, xml_sym = identify_mpb_chord(bar_pitches, detected_key)
-                            # Evita repetir a mesma cifra em compassos idênticos seguidos (exceto a cada 4 compassos)
-                            if mpb_sym and (mpb_sym != last_chord_mpb or idx_m % 4 == 0):
-                                last_chord_mpb = mpb_sym
-                                measure_chords[idx_m] = mpb_sym
+                        mpb_sym, xml_sym = detect_bar_chord(chroma_slice, bar_pitches, key_scale_pcs)
+                        if mpb_sym and (mpb_sym != last_mpb_sym or idx_m % 4 == 0):
+                            last_mpb_sym = mpb_sym
+                            first_notes = list(m.notes)
+                            if first_notes:
+                                # Ancora a cifra diretamente na 1ª nota do compasso (possui duração > 0, nunca quebra o LilyPond!)
+                                first_notes[0].addLyric(mpb_sym)
+                                xml_chords_to_insert.append((m, xml_sym))
 
-                                # 1. Injeção oficial de ChordSymbol para o arquivo MusicXML
-                                try:
-                                    cs_obj = music21.harmony.ChordSymbol(xml_sym)
-                                    m.insert(0, cs_obj)
-                                except Exception:
-                                    pass
-
-                                # 2. Ancoragem garantida no primeiro elemento do compasso para renderização no LilyPond PDF
-                                first_notes = list(m.notes)
-                                if first_notes:
-                                    first_el = first_notes[0]
-                                    # O LilyPond renderiza o lyric/texto com destaque claro no compasso
-                                    first_el.addLyric(f"[{mpb_sym}]")
+                    del chroma_full
+                    gc.collect()
 
                     score.insert(0, part)
 
-                    # Exportação MusicXML (contendo os objetos ChordSymbol oficiais)
-                    xml_path = OUTPUT_DIR / f"partitura_{session_id}.musicxml"
-                    score.write('musicxml', fp=str(xml_path))
-
-                    # Renderização Gráfica em PDF via LilyPond e Conversão Segura para PNG em bytes
+                    # 8. PRIMEIRO: GERA O PDF VIA LILYPOND (Sem objetos de duração 0.0!)
                     pdf_bytes = None
                     page_images = []
                     try:
                         ly_base = OUTPUT_DIR / f"partitura_{session_id}"
-                        generated_pdf = render_pdf_with_chords(score, ly_base, measure_chords)
-                        if not generated_pdf.exists():
-                            generated_pdf = Path(score.write('lily.pdf', fp=str(ly_base)))
-
+                        generated_pdf = Path(score.write('lily.pdf', fp=str(ly_base)))
                         if generated_pdf.exists():
                             pdf_bytes = generated_pdf.read_bytes()
                             pdf_doc = pdfium.PdfDocument(pdf_bytes)
@@ -482,6 +386,16 @@ if uploaded_file is not None:
                                 f.unlink(missing_ok=True)
                     except Exception as pdf_err:
                         st.warning(f"Nota na renderização visual do arquivo PDF: {pdf_err}")
+
+                    # 9. SEGUNDO: INSERE OS OBJETOS ChordSymbol OFICIAIS E EXPORTA O MUSICXML
+                    for m_obj, xml_sym in xml_chords_to_insert:
+                        try:
+                            m_obj.insert(0, music21.harmony.ChordSymbol(xml_sym))
+                        except Exception:
+                            pass
+
+                    xml_path = OUTPUT_DIR / f"partitura_{session_id}.musicxml"
+                    score.write('musicxml', fp=str(xml_path))
 
                     tonica_map = {'C': 'Dó', 'C#': 'Dó#', 'D': 'Ré', 'E': 'Mi', 'F': 'Fá', 'G': 'Sol', 'A': 'Lá', 'B': 'Si'}
                     tonic_pt = tonica_map.get(detected_key.tonic.name.replace('-', ''), detected_key.tonic.name)
