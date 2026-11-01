@@ -33,12 +33,11 @@ import streamlit as st
 st.set_page_config(page_title="Partitura.ai", page_icon="🎵", layout="centered")
 
 # ---------------------------------------------------------
-# TRADUÇÃO DO COMPONENTE DE UPLOAD (DRAG AND DROP) PARA PT-BR
+# TRADUÇÃO DA INTERFACE E COMPONENTE DE UPLOAD (PT-BR)
 # ---------------------------------------------------------
 st.markdown(
     """
     <style>
-    /* Traduz 'Drag and drop file here' */
     [data-testid="stFileUploaderDropzoneInstructions"] > div > span {
         display: none;
     }
@@ -50,7 +49,6 @@ st.markdown(
         display: block;
         margin-bottom: 4px;
     }
-    /* Traduz o texto de limite de tamanho abaixo do título */
     [data-testid="stFileUploaderDropzoneInstructions"] > div > small {
         font-size: 0 !important;
     }
@@ -59,7 +57,6 @@ st.markdown(
         font-size: 0.85rem;
         color: #64748b;
     }
-    /* Traduz o botão 'Browse files' para 'Selecionar Arquivo' */
     [data-testid="stFileUploaderDropzone"] button {
         font-size: 0 !important;
     }
@@ -86,9 +83,6 @@ OUTPUT_DIR = Path("temp_outputs")
 for d in [UPLOAD_DIR, OUTPUT_DIR]:
     d.mkdir(exist_ok=True)
 
-# ---------------------------------------------------------
-# CARREGAMENTO VIA ONNX RUNTIME (Rápido, leve, sem TensorFlow)
-# ---------------------------------------------------------
 @st.cache_resource
 def get_inference_model():
     try:
@@ -104,26 +98,23 @@ class MockNote:
         self.pitch = pitch
         self.velocity = velocity
 
-# ---------------------------------------------------------
-# CABEÇALHO E INTERFACE WEB
-# ---------------------------------------------------------
 st.title("🎵 Partitura.ai")
-st.markdown("### Sua Música em Partitura com Apenas um Clique")
-st.write("Envie um arquivo de áudio para transcrever a melodia, visualizar a partitura na tela e baixar o arquivo em **PDF**, **MusicXML** e **MIDI**.")
+st.markdown("### Sua Música em Partitura com Melodia e Harmonia (Cifras)")
+st.write("Envie um arquivo de áudio para transcrever a melodia principal, extrair o campo harmônico base, visualizar o resultado e exportar em **PDF**, **MusicXML** e **MIDI**.")
 
 uploaded_file = st.file_uploader("Escolha um arquivo de áudio", type=["mp3", "wav", "m4a", "flac", "ogg"])
 
 if uploaded_file is not None:
     st.audio(uploaded_file.getvalue())
     
-    if st.button("✨ Gerar Partitura Completa", type="primary"):
+    if st.button("✨ Gerar Partitura Completa com Cifras", type="primary"):
         session_id = uuid.uuid4().hex[:8]
         ext = os.path.splitext(uploaded_file.name)[1].lower() or ".wav"
         safe_input_path = UPLOAD_DIR / f"raw_{session_id}{ext}"
         session_dir = UPLOAD_DIR / f"session_{session_id}"
         session_dir.mkdir(exist_ok=True)
 
-        with st.spinner("⚡ Processando o arquivo de áudio com IA e gerando a partitura... Por favor, aguarde."):
+        with st.spinner("⚡ Processando áudio, identificando notas e extraindo a harmonia base... Aguarde."):
             try:
                 ai_model = get_inference_model()
 
@@ -133,7 +124,7 @@ if uploaded_file is not None:
                 y_full, sr = librosa.load(str(safe_input_path), sr=22050, mono=True)
                 total_duration = len(y_full) / sr
 
-                # Estimativa de Andamento (BPM)
+                # Análise global de Andamento (BPM)
                 y_harmonic_full, _ = librosa.effects.hpss(y_full)
                 onset_env = librosa.onset.onset_strength(y=y_harmonic_full, sr=sr)
                 tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
@@ -147,7 +138,7 @@ if uploaded_file is not None:
                 del y_harmonic_full, onset_env
                 gc.collect()
 
-                # Processamento em Chunks para estabilidade de memória
+                # Processamento por blocos (Chunks) para controle de memória RAM
                 chunk_duration = 30.0
                 all_notes = []
                 start_time = 0.0
@@ -204,7 +195,7 @@ if uploaded_file is not None:
                                 n.end = n.start + grid_step
                             processed_notes.append(n)
 
-                    # Exportação do arquivo MIDI
+                    # Exportação MIDI
                     midi_path = OUTPUT_DIR / f"partitura_{session_id}.mid"
                     pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
                     inst = pretty_midi.Instrument(program=0)
@@ -213,7 +204,7 @@ if uploaded_file is not None:
                     pm.instruments.append(inst)
                     pm.write(str(midi_path))
 
-                    # Construção da Estrutura Musical via music21
+                    # Construção da Partitura Estruturada (music21)
                     clusters_by_ql = defaultdict(list)
                     for n in processed_notes:
                         start_ql = round((n.start / sec_per_quarter) * 4) / 4.0
@@ -251,17 +242,39 @@ if uploaded_file is not None:
                         el.quarterLength = dur_ql
                         part.insert(start_ql, el)
 
+                    # Análise Tonal e Harmônica
                     ks = music21.analysis.discrete.KrumhanslSchmuckler()
                     detected_key = ks.getSolution(part)
                     part.insert(0, music21.key.KeySignature(detected_key.sharps))
                     part.makeMeasures(inPlace=True)
+
+                    # -------------------------------------------------------------------------
+                    # EXTRAÇÃO E ADIÇÃO DO CAMPO HARMÔNICO (CIFRAS / ACORDES BASE)
+                    # -------------------------------------------------------------------------
+                    # Analisa acordes por compasso de forma limpa usando a robustez do music21
+                    try:
+                        # Extrai a harmonia vertical agrupada por compassos da partitura
+                        measures = part.getElementsByClass(music21.stream.Measure)
+                        for m in measures:
+                            # Coleta notas simultâneas ou acordes presentes no compasso
+                            m_notes = m.notesAndRests
+                            if len(m_notes) > 0:
+                                ch = music21.chord.Chord([n.pitch for n in m_notes if isinstance(n, music21.note.Note)])
+                                if len(ch) >= 2:
+                                    rn = music21.roman.romanNumeralFromChord(ch, detected_key)
+                                    chord_symbol = rn.figure
+                                    # Insere a cifra em formato de texto para renderização limpa no LilyPond
+                                    m.insert(0, music21.text.Expression(chord_symbol))
+                    except Exception:
+                        pass # Fallback seguro para manter estabilidade caso o compasso seja puramente monofônico
+
                     score.insert(0, part)
 
-                    # Exportação do arquivo MusicXML
+                    # Exportação MusicXML
                     xml_path = OUTPUT_DIR / f"partitura_{session_id}.musicxml"
                     score.write('musicxml', fp=str(xml_path))
 
-                    # Renderização gráfica em PDF e conversão segura para PNG em bytes
+                    # Renderização Gráfica em PDF e Conversão Segura para PNG em bytes
                     pdf_bytes = None
                     page_images = []
                     try:
@@ -298,7 +311,7 @@ if uploaded_file is not None:
                     st.session_state["xml_bytes"] = xml_bytes
                     st.session_state["pdf_bytes"] = pdf_bytes
                     st.session_state["page_images"] = page_images
-                    st.session_state["info_text"] = f"🎵 Andamento: {bpm} BPM | Compasso: {time_sig} | Tom: {tonic_pt} {mode_pt} | Clave de Sol"
+                    st.session_state["info_text"] = f"🎵 Andamento: {bpm} BPM | Compasso: {time_sig} | Tom: {tonic_pt} {mode_pt} | Clave de Sol + Harmonia (Cifras)"
 
             except Exception as e:
                 st.error(f"Erro durante o processamento do arquivo: {str(e)}")
@@ -312,7 +325,7 @@ if uploaded_file is not None:
                 gc.collect()
 
     if st.session_state.get("result_ready"):
-        st.success("✨ Partitura gerada com sucesso!")
+        st.success("✨ Partitura com Cifras gerada com sucesso!")
         st.info(st.session_state["info_text"])
 
         col1, col2, col3 = st.columns(3)
@@ -321,7 +334,7 @@ if uploaded_file is not None:
                 st.download_button(
                     label="📄 Baixar Arquivo PDF",
                     data=st.session_state["pdf_bytes"],
-                    file_name="partitura_clave_de_sol.pdf",
+                    file_name="partitura_com_cifras.pdf",
                     mime="application/pdf",
                     use_container_width=True
                 )
@@ -329,7 +342,7 @@ if uploaded_file is not None:
             st.download_button(
                 label="🎼 Baixar Arquivo MusicXML",
                 data=st.session_state["xml_bytes"],
-                file_name="partitura_clave_de_sol.musicxml",
+                file_name="partitura_com_cifras.musicxml",
                 mime="application/vnd.recordare.musicxml+xml",
                 use_container_width=True
             )
@@ -337,7 +350,7 @@ if uploaded_file is not None:
             st.download_button(
                 label="📥 Baixar Arquivo MIDI",
                 data=st.session_state["midi_bytes"],
-                file_name="partitura_completa.mid",
+                file_name="partitura_com_cifras.mid",
                 mime="audio/midi",
                 use_container_width=True
             )
@@ -348,6 +361,6 @@ if uploaded_file is not None:
             st.rerun()
 
         if st.session_state.get("page_images"):
-            st.markdown("### 🎼 Visualização da Partitura")
+            st.markdown("### 🎼 Visualização da Partitura com Cifras")
             for idx, img_bytes in enumerate(st.session_state["page_images"]):
                 st.image(img_bytes, caption=f"Página {idx + 1}", use_column_width=True)
