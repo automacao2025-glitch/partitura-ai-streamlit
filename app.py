@@ -99,8 +99,8 @@ class MockNote:
         self.velocity = velocity
 
 st.title("🎵 Partitura.ai")
-st.markdown("### Sua Música em Partitura com Melodia e Harmonia (Cifras)")
-st.write("Envie um arquivo de áudio para transcrever a melodia principal, extrair o campo harmônico base, visualizar o resultado e exportar em **PDF**, **MusicXML** e **MIDI**.")
+st.markdown("### Sua Música em Partitura com Melodia e Cifras Harmônicas")
+st.write("Envie um arquivo de áudio para transcrever a melodia principal, extrair o campo harmônico (acordes base), visualizar a partitura na tela e baixar em **PDF**, **MusicXML** e **MIDI**.")
 
 uploaded_file = st.file_uploader("Escolha um arquivo de áudio", type=["mp3", "wav", "m4a", "flac", "ogg"])
 
@@ -114,7 +114,7 @@ if uploaded_file is not None:
         session_dir = UPLOAD_DIR / f"session_{session_id}"
         session_dir.mkdir(exist_ok=True)
 
-        with st.spinner("⚡ Processando áudio, identificando notas e extraindo a harmonia base... Aguarde."):
+        with st.spinner("⚡ Processando áudio, estruturando notas e extraindo cifras harmônicas... Aguarde."):
             try:
                 ai_model = get_inference_model()
 
@@ -138,7 +138,7 @@ if uploaded_file is not None:
                 del y_harmonic_full, onset_env
                 gc.collect()
 
-                # Processamento por blocos (Chunks) para controle de memória RAM
+                # Processamento em Chunks para otimização de memória RAM na nuvem
                 chunk_duration = 30.0
                 all_notes = []
                 start_time = 0.0
@@ -248,25 +248,23 @@ if uploaded_file is not None:
                     part.insert(0, music21.key.KeySignature(detected_key.sharps))
                     part.makeMeasures(inPlace=True)
 
-                    # -------------------------------------------------------------------------
-                    # EXTRAÇÃO E ADIÇÃO DO CAMPO HARMÔNICO (CIFRAS / ACORDES BASE)
-                    # -------------------------------------------------------------------------
-                    # Analisa acordes por compasso de forma limpa usando a robustez do music21
+                    # ---------------------------------------------------------
+                    # MÓDULO DE EXTRAÇÃO DE CIFRAS / HARMÔNIA BASE
+                    # ---------------------------------------------------------
                     try:
-                        # Extrai a harmonia vertical agrupada por compassos da partitura
                         measures = part.getElementsByClass(music21.stream.Measure)
                         for m in measures:
-                            # Coleta notas simultâneas ou acordes presentes no compasso
                             m_notes = m.notesAndRests
                             if len(m_notes) > 0:
-                                ch = music21.chord.Chord([n.pitch for n in m_notes if isinstance(n, music21.note.Note)])
-                                if len(ch) >= 2:
+                                chord_pitches = [n.pitch for n in m_notes if isinstance(n, music21.note.Note)]
+                                if len(chord_pitches) >= 2:
+                                    ch = music21.chord.Chord(chord_pitches)
                                     rn = music21.roman.romanNumeralFromChord(ch, detected_key)
                                     chord_symbol = rn.figure
-                                    # Insere a cifra em formato de texto para renderização limpa no LilyPond
+                                    # Inserção da cifra como expressão de texto alinhada acima da pauta
                                     m.insert(0, music21.text.Expression(chord_symbol))
                     except Exception:
-                        pass # Fallback seguro para manter estabilidade caso o compasso seja puramente monofônico
+                        pass # Garante estabilidade contínua caso haja trechos exclusivamente monofônicos
 
                     score.insert(0, part)
 
@@ -274,7 +272,7 @@ if uploaded_file is not None:
                     xml_path = OUTPUT_DIR / f"partitura_{session_id}.musicxml"
                     score.write('musicxml', fp=str(xml_path))
 
-                    # Renderização Gráfica em PDF e Conversão Segura para PNG em bytes
+                    # Renderização Gráfica em PDF e Conversão para Imagens PNG em Memória
                     pdf_bytes = None
                     page_images = []
                     try:
@@ -311,7 +309,7 @@ if uploaded_file is not None:
                     st.session_state["xml_bytes"] = xml_bytes
                     st.session_state["pdf_bytes"] = pdf_bytes
                     st.session_state["page_images"] = page_images
-                    st.session_state["info_text"] = f"🎵 Andamento: {bpm} BPM | Compasso: {time_sig} | Tom: {tonic_pt} {mode_pt} | Clave de Sol + Harmonia (Cifras)"
+                    st.session_state["info_text"] = f"🎵 Andamento: {bpm} BPM | Compasso: {time_sig} | Tom: {tonic_pt} {mode_pt} | Clave de Sol + Cifras Harmônicas"
 
             except Exception as e:
                 st.error(f"Erro durante o processamento do arquivo: {str(e)}")
