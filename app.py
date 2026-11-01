@@ -1,5 +1,6 @@
 import sys
 import os
+import io
 import gc
 import uuid
 import shutil
@@ -30,6 +31,46 @@ except ImportError:
 import streamlit as st
 
 st.set_page_config(page_title="Partitura.ai", page_icon="🎵", layout="centered")
+
+# ---------------------------------------------------------
+# TRADUÇÃO DO COMPONENTE DE UPLOAD (DRAG AND DROP) PARA PT-BR
+# ---------------------------------------------------------
+st.markdown(
+    """
+    <style>
+    /* Traduz 'Drag and drop file here' */
+    [data-testid="stFileUploaderDropzoneInstructions"] > div > span {
+        display: none;
+    }
+    [data-testid="stFileUploaderDropzoneInstructions"] > div::before {
+        content: "Arraste e solte o arquivo de áudio aqui";
+        font-weight: 500;
+        font-size: 1rem;
+        color: #1e293b;
+        display: block;
+        margin-bottom: 4px;
+    }
+    /* Traduz o texto de limite de tamanho abaixo do título */
+    [data-testid="stFileUploaderDropzoneInstructions"] > div > small {
+        font-size: 0 !important;
+    }
+    [data-testid="stFileUploaderDropzoneInstructions"] > div > small::after {
+        content: "Limite de 200MB por arquivo • MP3, WAV, M4A, FLAC, OGG";
+        font-size: 0.85rem;
+        color: #64748b;
+    }
+    /* Traduz o botão 'Browse files' para 'Selecionar Arquivo' */
+    [data-testid="stFileUploaderDropzone"] button {
+        font-size: 0 !important;
+    }
+    [data-testid="stFileUploaderDropzone"] button::after {
+        content: "Selecionar Arquivo";
+        font-size: 0.875rem !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 import numpy as np
 import librosa
@@ -63,11 +104,14 @@ class MockNote:
         self.pitch = pitch
         self.velocity = velocity
 
-st.title("🎵 Partitura.ai - Motor Universal")
-st.markdown("### Transcrição Musical Inteligente e Completa por IA")
-st.write("Envie um ficheiro de áudio para transcrever a melodia, visualizar a partitura na tela e exportar em **PDF**, **MusicXML** e **MIDI**.")
+# ---------------------------------------------------------
+# CABEÇALHO E INTERFACE WEB
+# ---------------------------------------------------------
+st.title("🎵 Partitura.ai")
+st.markdown("### Sua Música em Partitura com Apenas um Clique")
+st.write("Envie um arquivo de áudio para transcrever a melodia, visualizar a partitura na tela e baixar o arquivo em **PDF**, **MusicXML** e **MIDI**.")
 
-uploaded_file = st.file_uploader("Escolha um ficheiro de áudio", type=["mp3", "wav", "m4a", "flac", "ogg"])
+uploaded_file = st.file_uploader("Escolha um arquivo de áudio", type=["mp3", "wav", "m4a", "flac", "ogg"])
 
 if uploaded_file is not None:
     st.audio(uploaded_file.getvalue())
@@ -79,7 +123,7 @@ if uploaded_file is not None:
         session_dir = UPLOAD_DIR / f"session_{session_id}"
         session_dir.mkdir(exist_ok=True)
 
-        with st.spinner("⚡ A transcrever áudio com IA e a compor a partitura... Por favor, aguarde."):
+        with st.spinner("⚡ Processando o arquivo de áudio com IA e gerando a partitura... Por favor, aguarde."):
             try:
                 ai_model = get_inference_model()
 
@@ -142,7 +186,7 @@ if uploaded_file is not None:
                 gc.collect()
 
                 if not all_notes:
-                    st.error("Nenhuma nota musical clara foi detetada neste áudio.")
+                    st.error("Nenhuma nota musical clara foi detectada neste arquivo de áudio.")
                 else:
                     sec_per_quarter = 60.0 / bpm
                     beats_per_bar = int(time_sig.split("/")[0])
@@ -160,7 +204,7 @@ if uploaded_file is not None:
                                 n.end = n.start + grid_step
                             processed_notes.append(n)
 
-                    # Exportação MIDI
+                    # Exportação do arquivo MIDI
                     midi_path = OUTPUT_DIR / f"partitura_{session_id}.mid"
                     pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
                     inst = pretty_midi.Instrument(program=0)
@@ -213,11 +257,11 @@ if uploaded_file is not None:
                     part.makeMeasures(inPlace=True)
                     score.insert(0, part)
 
-                    # Exportação MusicXML
+                    # Exportação do arquivo MusicXML
                     xml_path = OUTPUT_DIR / f"partitura_{session_id}.musicxml"
                     score.write('musicxml', fp=str(xml_path))
 
-                    # Renderização gráfica em PDF e Imagens de Página
+                    # Renderização gráfica em PDF e conversão segura para PNG em bytes
                     pdf_bytes = None
                     page_images = []
                     try:
@@ -229,13 +273,15 @@ if uploaded_file is not None:
                             for i in range(len(pdf_doc)):
                                 page = pdf_doc[i]
                                 pil_image = page.render(scale=2).to_pil()
-                                page_images.append(pil_image)
+                                img_buf = io.BytesIO()
+                                pil_image.save(img_buf, format="PNG")
+                                page_images.append(img_buf.getvalue())
                             generated_pdf.unlink(missing_ok=True)
                         for f in OUTPUT_DIR.glob(f"partitura_{session_id}*"):
                             if f.suffix not in ['.mid', '.musicxml']:
                                 f.unlink(missing_ok=True)
                     except Exception as pdf_err:
-                        st.warning(f"Nota da renderização do PDF: {pdf_err}")
+                        st.warning(f"Nota na renderização visual do arquivo PDF: {pdf_err}")
 
                     tonica_map = {'C': 'Dó', 'C#': 'Dó#', 'D': 'Ré', 'E': 'Mi', 'F': 'Fá', 'G': 'Sol', 'A': 'Lá', 'B': 'Si'}
                     tonic_pt = tonica_map.get(detected_key.tonic.name.replace('-', ''), detected_key.tonic.name)
@@ -252,10 +298,10 @@ if uploaded_file is not None:
                     st.session_state["xml_bytes"] = xml_bytes
                     st.session_state["pdf_bytes"] = pdf_bytes
                     st.session_state["page_images"] = page_images
-                    st.session_state["info_text"] = f"🎵 Ritmo: {bpm} BPM | Compasso: {time_sig} | Tom: {tonic_pt} {mode_pt} | Clave de Sol"
+                    st.session_state["info_text"] = f"🎵 Andamento: {bpm} BPM | Compasso: {time_sig} | Tom: {tonic_pt} {mode_pt} | Clave de Sol"
 
             except Exception as e:
-                st.error(f"Erro durante o processamento: {str(e)}")
+                st.error(f"Erro durante o processamento do arquivo: {str(e)}")
             finally:
                 if safe_input_path.exists():
                     try: safe_input_path.unlink()
@@ -266,14 +312,14 @@ if uploaded_file is not None:
                 gc.collect()
 
     if st.session_state.get("result_ready"):
-        st.success("✨ Transcrição concluída com sucesso!")
+        st.success("✨ Partitura gerada com sucesso!")
         st.info(st.session_state["info_text"])
 
         col1, col2, col3 = st.columns(3)
         with col1:
             if st.session_state.get("pdf_bytes"):
                 st.download_button(
-                    label="📄 Baixar PDF (.pdf)",
+                    label="📄 Baixar Arquivo PDF",
                     data=st.session_state["pdf_bytes"],
                     file_name="partitura_clave_de_sol.pdf",
                     mime="application/pdf",
@@ -281,7 +327,7 @@ if uploaded_file is not None:
                 )
         with col2:
             st.download_button(
-                label="🎼 Baixar MusicXML",
+                label="🎼 Baixar Arquivo MusicXML",
                 data=st.session_state["xml_bytes"],
                 file_name="partitura_clave_de_sol.musicxml",
                 mime="application/vnd.recordare.musicxml+xml",
@@ -289,7 +335,7 @@ if uploaded_file is not None:
             )
         with col3:
             st.download_button(
-                label="📥 Baixar MIDI (.mid)",
+                label="📥 Baixar Arquivo MIDI",
                 data=st.session_state["midi_bytes"],
                 file_name="partitura_completa.mid",
                 mime="audio/midi",
@@ -297,6 +343,6 @@ if uploaded_file is not None:
             )
 
         if st.session_state.get("page_images"):
-            st.markdown("### 🎼 Partitura Gerada")
-            for idx, img in enumerate(st.session_state["page_images"]):
-                st.image(img, caption=f"Página {idx + 1}", use_container_width=True)
+            st.markdown("### 🎼 Visualização da Partitura")
+            for idx, img_bytes in enumerate(st.session_state["page_images"]):
+                st.image(img_bytes, caption=f"Página {idx + 1}", use_column_width=True)
