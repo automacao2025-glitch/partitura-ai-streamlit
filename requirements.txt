@@ -1,4 +1,6 @@
-streamlit>=1.40.0
+streamlit==1.39.0
+starlette<0.39.0
+uvicorn<0.31.0
 setuptools>=68.0.0,<75.0.0
 wheel
 numpy==1.26.4
