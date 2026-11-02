@@ -84,16 +84,16 @@ for d in [UPLOAD_DIR, OUTPUT_DIR]:
     d.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------
-# 1. PAINEL CENTRAL DE CALIBRAÇÃO (CONFIG_CALIBRACAO - ESTADO DA ARTE)
+# 1. PAINEL CENTRAL DE CALIBRAÇÃO (CONFIG_CALIBRACAO)
 # ---------------------------------------------------------
 CONFIG_CALIBRACAO = {
-    "CORTE_PITCH_MELODIA": 52,             # Limite refinado para separar baixos/harmonia da melodia visual
-    "MAX_NOTAS_CLUSTER_VISUAL": 2,         # Mantém a pauta limpa na Clave de Sol (Lead Sheet)
-    "VELOCITY_MIN_MELODIA": 42,            # Filtro rigoroso contra ruídos e ressonâncias indesejadas
-    "VELOCITY_MIN_HARMONIA": 35,           # Sensibilidade ideal para capturar o campo harmônico polifônico
-    "DURACAO_MIN_NOTA_SEG": 0.09,          # Descarta micro-estalos e transientes de percussão
-    "SUBDIVISAO_MINIMA_QL": 0.25,          # Trava na semicolcheia (filtro elástico anti-rubato)
-    "PESO_MINIMO_ACORDE": 0.22,            # Exige peso real (duração x velocity) para consolidar a cifra do acorde
+    "CORTE_PITCH_MELODIA": 52,             
+    "MAX_NOTAS_CLUSTER_VISUAL": 2,         
+    "VELOCITY_MIN_MELODIA": 42,            
+    "VELOCITY_MIN_HARMONIA": 35,           
+    "DURACAO_MIN_NOTA_SEG": 0.09,          
+    "SUBDIVISAO_MINIMA_QL": 0.25,          
+    "PESO_MINIMO_ACORDE": 0.22,            
 }
 
 # ---------------------------------------------------------
@@ -115,7 +115,7 @@ class MockNote:
         self.velocity = velocity
 
 # ---------------------------------------------------------
-# 2. FUNÇÕES MODULARES ISOLADAS (ARQUITETURA DUAL-STREAM E HARMONIA)
+# 2. FUNÇÕES MODULARES ISOLADAS
 # ---------------------------------------------------------
 def format_root_pt_br(pitch_name: str) -> str:
     if not pitch_name:
@@ -367,12 +367,16 @@ if uploaded_file is not None:
                     for idx, start_ql in enumerate(sorted_offsets):
                         cluster = melody_clusters[start_ql]
                         raw_dur_ql = max((c.end - c.start) / sec_per_quarter for c in cluster)
+                        
+                        # SANITIZAÇÃO DE DURAÇÃO: Arredonda rigorosamente para múltiplos válidos (0.25, 0.5, 1.0, etc.)
                         dur_ql = round(raw_dur_ql * 4) / 4.0
+                        if dur_ql <= 0:
+                            dur_ql = 0.25
 
                         if idx + 1 < len(sorted_offsets):
                             max_allowed = sorted_offsets[idx + 1] - start_ql
                             if dur_ql > max_allowed:
-                                dur_ql = max_allowed
+                                dur_ql = max(0.25, round(max_allowed * 4) / 4.0)
 
                         dur_ql = max(0.25, min(float(beats_per_bar), dur_ql))
                         pitches_in_cluster = sorted(list({int(c.pitch) for c in cluster}))[-CONFIG_CALIBRACAO["MAX_NOTAS_CLUSTER_VISUAL"]:]
@@ -387,7 +391,12 @@ if uploaded_file is not None:
 
                     detected_key = detectar_centro_tonal_global(part)
                     part.insert(0, music21.key.KeySignature(detected_key.sharps))
-                    part.makeMeasures(inPlace=True)
+                    
+                    # BLINDAGEM DE COMPASSOS: Garante que o music21 não gere durações inexpressíveis
+                    try:
+                        part.makeMeasures(inPlace=True, strictPadding=False)
+                    except Exception:
+                        part.makeMeasures(inPlace=True)
 
                     measures = list(part.getElementsByClass(music21.stream.Measure))
                     xml_chords_to_insert = []
@@ -433,9 +442,9 @@ if uploaded_file is not None:
                             if f.suffix not in ['.mid', '.musicxml']:
                                 f.unlink(missing_ok=True)
                     except Exception as pdf_err:
-                        st.warning(f"O motor LilyPond no Render demorou a responder ou encontrou restrição pontual: {pdf_err}. Os arquivos MIDI e MusicXML foram gerados com sucesso.")
+                        st.warning(f"O motor LilyPond no Render encontrou restrição pontual: {pdf_err}. Os ficheiros MIDI e MusicXML foram gerados com sucesso.")
 
-                    # ETAPA 2: Inserção tardia de ChordSymbol e Exportação MusicXML
+                    # ETAPA 2: Inserção tardia de ChordSymbol e Exportação MusicXML Blindada
                     for m_obj, xml_sym in xml_chords_to_insert:
                         try:
                             cs_obj = music21.harmony.ChordSymbol(xml_sym)
@@ -445,7 +454,11 @@ if uploaded_file is not None:
                             pass
 
                     xml_path = OUTPUT_DIR / f"partitura_{session_id}.musicxml"
-                    score.write('musicxml', fp=str(xml_path))
+                    try:
+                        score.write('musicxml', fp=str(xml_path))
+                    except Exception:
+                        # Fallback seguro caso ocorra incompatibilidade extrema de oitava no XML
+                        part.write('musicxml', fp=str(xml_path))
 
                     tonica_map = {'C': 'Dó', 'C#': 'Dó#', 'D': 'Ré', 'E': 'Mi', 'F': 'Fá', 'G': 'Sol', 'A': 'Lá', 'B': 'Si'}
                     tonic_pt = tonica_map.get(detected_key.tonic.name.replace('-', ''), detected_key.tonic.name)
