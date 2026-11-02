@@ -85,16 +85,16 @@ for d in [UPLOAD_DIR, OUTPUT_DIR]:
     d.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------
-# 1. PAINEL CENTRAL DE CALIBRAÇÃO (CONFIG_CALIBRACAO)
+# 1. PAINEL CENTRAL DE CALIBRAÇÃO (CONFIG_CALIBRACAO - TESTE A)
 # ---------------------------------------------------------
 CONFIG_CALIBRACAO = {
-    "CORTE_PITCH_MELODIA": 52,             # Limite refinado para separar baixos/harmonia da melodia visual
-    "MAX_NOTAS_CLUSTER_VISUAL": 2,         # Mantém a pauta limpa na Clave de Sol (Lead Sheet)
-    "VELOCITY_MIN_MELODIA": 42,            # Filtro rigoroso contra ruídos e ressonâncias indesejadas
-    "VELOCITY_MIN_HARMONIA": 35,           # Sensibilidade ideal para capturar o campo harmônico polifônico
-    "DURACAO_MIN_NOTA_SEG": 0.09,          # Descarta micro-estalos e transientes de percussão
-    "SUBDIVISAO_MINIMA_QL": 0.25,          # Trava na semicolcheia (filtro elástico anti-rubato)
-    "PESO_MINIMO_ACORDE": 0.22,            # Exige peso real (duração x velocity) para consolidar a cifra do acorde
+    "CORTE_PITCH_MELODIA": 55,             # 52 -> 55 (reduzir notas graves do acompanhamento)
+    "MAX_NOTAS_CLUSTER_VISUAL": 1,         # 2 -> 1 (gerar linha melódica monofônica limpa)
+    "VELOCITY_MIN_MELODIA": 50,            # 42 -> 50 (eliminar notas fracas e ressonâncias)
+    "VELOCITY_MIN_HARMONIA": 45,           # 35 -> 45 (reduzir contaminação na análise harmônica)
+    "DURACAO_MIN_NOTA_SEG": 0.11,          # 0.09 -> 0.11 (filtrar transientes curtos)
+    "SUBDIVISAO_MINIMA_QL": 0.25,          # Mantido (semicolcheia como grade mínima)
+    "PESO_MINIMO_ACORDE": 0.22,            # Mantido
 }
 
 # ---------------------------------------------------------
@@ -261,13 +261,11 @@ def quantizar_e_filtrar_fluxos(all_notes, bpm, time_sig, config):
             if q_end_ql <= q_start_ql:
                 q_end_ql = q_start_ql + grid_step_ql
 
-            # Garante precisão binária limpa (múltiplos exatos de 0.25)
             q_start_ql = round(q_start_ql * 4.0) / 4.0
             q_end_ql = round(q_end_ql * 4.0) / 4.0
 
             bar_idx = int(q_start_ql // bar_length_ql)
 
-            # Fluxo Harmônico Polifônico Real (mantém oitava original e graves)
             if n.velocity >= config["VELOCITY_MIN_HARMONIA"]:
                 weight = dur_sec * (n.velocity / 127.0)
                 harmonic_stream_by_bar[bar_idx].append({
@@ -275,7 +273,6 @@ def quantizar_e_filtrar_fluxos(all_notes, bpm, time_sig, config):
                     'weight': weight
                 })
 
-            # Fluxo Melódico Visual (Clave de Sol limpa)
             if n.velocity >= config["VELOCITY_MIN_MELODIA"] and n.pitch >= config["CORTE_PITCH_MELODIA"]:
                 melody_pitch = int(n.pitch)
                 while melody_pitch < 55:
@@ -309,7 +306,7 @@ def detectar_centro_tonal_global(part):
 
 def auditar_e_sanitizar_duracoes_musicxml(stream_obj):
     """
-    Varre o Score/Part antes da exportação MusicXML, registando e corrigindo
+    Varre o Score/Part antes da exportação MusicXML, registrando e corrigindo
     qualquer elemento com duration.type == 'inexpressible' ou quarterLength inválido.
     """
     for m in stream_obj.recurse().getElementsByClass(music21.stream.Measure):
@@ -351,7 +348,6 @@ if uploaded_file is not None:
     st.audio(uploaded_file.getvalue())
     
     if st.button("✨ Gerar Partitura Completa com Cifras", type="primary"):
-        # PONTO 4: Limpeza preventiva do session_state antes de iniciar nova transcrição
         for k in ["result_ready", "midi_bytes", "xml_bytes", "pdf_bytes", "page_images", "info_text"]:
             if k in st.session_state:
                 del st.session_state[k]
@@ -372,7 +368,6 @@ if uploaded_file is not None:
                 y_full, sr = librosa.load(str(safe_input_path), sr=22050, mono=True)
                 total_duration = len(y_full) / sr
 
-                # PONTO 9: Detecção e normalização robusta de BPM
                 sample_limit = min(len(y_full), int(45.0 * sr))
                 onset_env = librosa.onset.onset_strength(y=y_full[:sample_limit], sr=sr)
                 tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
@@ -387,7 +382,6 @@ if uploaded_file is not None:
                     bpm *= 2.0
                 bpm = round(bpm, 1)
 
-                # Definição de compasso (Manual vs Automático com indicação transparente)
                 if compasso_selecionado != "Automático":
                     time_sig = compasso_selecionado
                     compasso_exibicao = f"{time_sig} (Manual)"
@@ -398,7 +392,6 @@ if uploaded_file is not None:
                 del onset_env
                 gc.collect()
 
-                # Inferência do Basic Pitch em blocos de 60s
                 chunk_duration = 60.0
                 all_notes = []
                 start_time = 0.0
@@ -443,21 +436,16 @@ if uploaded_file is not None:
                 if not all_notes:
                     st.error("Nenhuma nota musical clara foi detectada neste arquivo de áudio.")
                 else:
-                    # Executa a separação Dual-Stream com unidades desacopladas
                     melody_clusters, harmonic_stream_by_bar, bar_length_ql = quantizar_e_filtrar_fluxos(
                         all_notes, bpm, time_sig, CONFIG_CALIBRACAO
                     )
 
-                    # PONTO 7: Verifica se melody_clusters ficou vazio após o filtro visual
                     if not melody_clusters:
                         st.warning(
                             "Foram detectadas notas no áudio, mas nenhuma atingiu os limiares do filtro melódico principal "
                             "(altura ou intensidade mínimas). Tente enviar uma gravação com a melodia mais destacada."
                         )
                     else:
-                        # ---------------------------------------------------------
-                        # EXPORTAÇÃO MIDI (Usa estritamente segundos: start_sec / end_sec)
-                        # ---------------------------------------------------------
                         midi_path = OUTPUT_DIR / f"partitura_{session_id}.mid"
                         pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
                         inst = pretty_midi.Instrument(program=0)
@@ -472,9 +460,6 @@ if uploaded_file is not None:
                         pm.instruments.append(inst)
                         pm.write(str(midi_path))
 
-                        # ---------------------------------------------------------
-                        # CONSTRUÇÃO DO SCORE NO MUSIC21 (Usa estritamente QuarterLength)
-                        # ---------------------------------------------------------
                         score = music21.stream.Score()
                         score.insert(0, music21.metadata.Metadata())
                         score.metadata.title = os.path.splitext(uploaded_file.name)[0]
@@ -494,7 +479,6 @@ if uploaded_file is not None:
                             if dur_ql <= 0.0:
                                 dur_ql = 0.25
 
-                            # PONTO 2: Comparação de max_allowed_ql 100% em quarterLength
                             if idx + 1 < len(sorted_offsets_ql):
                                 next_start_ql = sorted_offsets_ql[idx + 1]
                                 max_allowed_ql = round((next_start_ql - start_ql) * 4.0) / 4.0
@@ -514,16 +498,13 @@ if uploaded_file is not None:
                             el.quarterLength = dur_ql
                             part.insert(float(start_ql), el)
 
-                        # Detecção Tonal Global com fallback seguro
                         detected_key, key_success = detectar_centro_tonal_global(part)
                         part.insert(0, music21.key.KeySignature(detected_key.sharps))
                         
-                        # Sequência Canônica: makeMeasures -> makeTies -> Auditoria
                         part.makeMeasures(inPlace=True)
                         part.makeTies(inPlace=True)
                         auditar_e_sanitizar_duracoes_musicxml(part)
 
-                        # Extração e ancoragem das cifras por compasso
                         measures = list(part.getElementsByClass(music21.stream.Measure))
                         xml_chords_to_insert = []
                         last_mpb_sym = None
@@ -551,9 +532,6 @@ if uploaded_file is not None:
 
                         score.insert(0, part)
 
-                        # ---------------------------------------------------------
-                        # ETAPA 1: Renderização em PDF via LilyPond (Sem Duration 0.0)
-                        # ---------------------------------------------------------
                         pdf_bytes = None
                         page_images = []
                         try:
@@ -573,22 +551,17 @@ if uploaded_file is not None:
                                 if f.suffix not in ['.mid', '.musicxml']:
                                     f.unlink(missing_ok=True)
                         except Exception as pdf_err:
-                            # PONTO 10: Mensagem precisa sobre a continuidade do fluxo
                             st.warning(
                                 f"O PDF não pôde ser gerado pelo LilyPond ({pdf_err}). "
                                 "O processamento do MIDI e do MusicXML continuará normalmente."
                             )
 
-                        # ---------------------------------------------------------
-                        # ETAPA 2: Inserção de ChordSymbol com Log e Exportação MusicXML
-                        # ---------------------------------------------------------
                         for m_obj, mpb_sym, xml_sym in xml_chords_to_insert:
                             try:
                                 cs_obj = music21.harmony.ChordSymbol(xml_sym)
                                 cs_obj.writeAsChord = False
                                 m_obj.insert(0, cs_obj)
                             except Exception as cs_err:
-                                # PONTO 6: Registo detalhado de falha de ChordSymbol
                                 print(
                                     f"[Auditoria ChordSymbol] Compasso {m_obj.number}: "
                                     f"mpb='{mpb_sym}', xml='{xml_sym}' falhou -> {cs_err}"
@@ -600,7 +573,6 @@ if uploaded_file is not None:
                         try:
                             score.write('musicxml', fp=str(xml_path))
                         except Exception as xml_err:
-                            # PONTO 11: Regista o erro original antes de tentar o fallback
                             print(f"[Erro MusicXML Principal] score.write falhou: {xml_err}")
                             part.write('musicxml', fp=str(xml_path))
 
@@ -630,7 +602,6 @@ if uploaded_file is not None:
             except Exception as e:
                 st.error(f"Erro crítico durante o processamento do arquivo: {str(e)}")
             finally:
-                # PONTO 5: Limpeza garantida de todos os ficheiros temporários da sessão
                 if safe_input_path.exists():
                     try:
                         safe_input_path.unlink()
