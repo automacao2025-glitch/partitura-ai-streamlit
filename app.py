@@ -85,16 +85,28 @@ for d in [UPLOAD_DIR, OUTPUT_DIR]:
     d.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------
-# 1. PAINEL CENTRAL DE CALIBRAÇÃO (CONFIG_CALIBRACAO - TESTE A)
+# 1. PAINEL CENTRAL DE CALIBRAÇÃO (CONFIG_CALIBRACAO - TESTE A/A2)
 # ---------------------------------------------------------
 CONFIG_CALIBRACAO = {
-    "CORTE_PITCH_MELODIA": 55,             # 52 -> 55 (reduzir notas graves do acompanhamento)
-    "MAX_NOTAS_CLUSTER_VISUAL": 1,         # 2 -> 1 (gerar linha melódica monofônica limpa)
-    "VELOCITY_MIN_MELODIA": 50,            # 42 -> 50 (eliminar notas fracas e ressonâncias)
-    "VELOCITY_MIN_HARMONIA": 45,           # 35 -> 45 (reduzir contaminação na análise harmônica)
-    "DURACAO_MIN_NOTA_SEG": 0.11,          # 0.09 -> 0.11 (filtrar transientes curtos)
-    "SUBDIVISAO_MINIMA_QL": 0.25,          # Mantido (semicolcheia como grade mínima)
-    "PESO_MINIMO_ACORDE": 0.22,            # Mantido
+    "CORTE_PITCH_MELODIA": 55,             # 55 (reduzir notas graves do acompanhamento)
+    "MAX_NOTAS_CLUSTER_VISUAL": 1,         # 1 (gerar linha melódica monofônica limpa)
+    "VELOCITY_MIN_MELODIA": 50,            # 50 (eliminar notas fracas e ressonâncias)
+    "VELOCITY_MIN_HARMONIA": 45,           # 45 (reduzir contaminação na análise harmônica)
+    "DURACAO_MIN_NOTA_SEG": 0.11,          # 0.11 (filtrar transientes curtos)
+    "SUBDIVISAO_MINIMA_QL": 0.25,          # Semicolcheia como grade mínima
+    "PESO_MINIMO_ACORDE": 0.22,            # Peso de consolidação harmônica
+}
+
+# ---------------------------------------------------------
+# PESOS DO CLASSIFICADOR MULTIFATOR DE COMPASSO (TESTE A2)
+# ---------------------------------------------------------
+PESOS_DETECCAO_METRICA = {
+    "w_periodicity": 0.40,
+    "w_accent_phase": 0.25,
+    "w_harmonic_change": 0.15,
+    "w_recurrence": 0.10,
+    "w_segment_consistency": 0.10,
+    "limiar_margem_ambiguidade": 0.075     # Margem mínima para aceitar automaticamente
 }
 
 # ---------------------------------------------------------
@@ -116,7 +128,290 @@ class MockNote:
         self.velocity = int(velocity)
 
 # ---------------------------------------------------------
-# 2. FUNÇÕES MODULARES ISOLADAS E CONVERSORES SEGUROS
+# 2. DETECTOR HÍBRIDO LEVE DE COMPASSO (TESTE A2)
+# ---------------------------------------------------------
+def _analisar_segmento_metrico(y_seg, sr, bpm):
+    """Analisa um segmento de áudio e pontua 2/4, 3/4, 4/4 e 6/8."""
+    candidates = ["2/4", "3/4", "4/4", "6/8"]
+    scores = {c: 0.0 for c in candidates}
+    best_phase = {c: 0 for c in candidates}
+
+    if len(y_seg) < sr * 3:
+        return scores, best_phase
+
+    # HPSS leve
+    try:
+        y_harm, y_perc = librosa.effects.hpss(y_seg)
+    except Exception:
+        y_harm, y_perc = y_seg, y_seg
+
+    # Onset Envelope
+    hop_length = 512
+    onset_env = librosa.onset.onset_strength(y=y_perc, sr=sr, hop_length=hop_length)
+    if len(onset_env) == 0 or np.max(onset_env) == 0:
+        return scores, best_phase
+
+    onset_env = onset_env / (np.max(onset_env) + 1e-8)
+
+    # Beat tracking local
+    _, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=hop_length, bpm=bpm)
+    if len(beats) < 8:
+        return scores, best_phase
+
+    # Periodicidade via Autocorrelação de Tempogram
+    tempogram = librosa.feature.tempogram(onset_envelope=onset_env, sr=sr, hop_length=hop_length)
+    ac_global = np.mean(tempogram, axis=1)
+    
+    # 1. Periodicidade Rítmica
+    # Razão de pulso a cada 2, 3 e 4 beats
+    n_frames = len(onset_env)
+    sec_per_beat = 60.0 / bpm
+    frames_per_beat = max(1, int((sec_per_beat * sr) / hop_length))
+
+    def _pegar_energia_lag(mult):
+        lag = int(round(frames_per_beat * mult))
+        if lag < len(ac_global):
+            return float(ac_global[lag])
+        return 0.0
+
+    e_2 = _pegar_energia_lag(2.0)
+    e_3 = _pegar_energia_lag(3.0)
+    e_4 = _pegar_energia_lag(4.0)
+    e_total = e_2 + e_3 + e_4 + 1e-8
+
+    p_2_4 = (e_2 * 0.6 + e_4 * 0.4) / e_total
+    p_3_4 = e_3 / e_total
+    p_4_4 = (e_4 * 0.7 + e_2 * 0.3) / e_total
+
+    # Subdivisão binária vs ternária para 3/4 x 6/8
+    # 6/8 tem 2 tempos pontuados compostos (subdivisão ternária de cada beat)
+    # 3/4 tem 3 tempos simples com subdivisão binária
+    subdiv_ternaria = 0.0
+    lag_tern = int(round(frames_per_beat / 3.0))
+    lag_bin = int(round(frames_per_beat / 2.0))
+    if lag_tern < len(ac_global) and lag_bin < len(ac_global):
+        e_tern = ac_global[lag_tern]
+        e_bin = ac_global[lag_bin]
+        subdiv_ternaria = float(e_tern / (e_tern + e_bin + 1e-8))
+
+    p_6_8 = (e_2 * 0.5 + e_3 * 0.5) / e_total
+    if subdiv_ternaria > 0.52:
+        p_6_8 *= 1.3
+        p_3_4 *= 0.8
+    else:
+        p_3_4 *= 1.2
+        p_6_8 *= 0.7
+
+    # 2. Teste de Fase / Downbeat e Acentuação
+    # Intensidade do onset_env sincronizado com cada beat
+    beat_strengths = []
+    for b in beats:
+        b_idx = int(b)
+        if b_idx < len(onset_env):
+            # Janela de tolerância em torno do beat
+            w_start = max(0, b_idx - 2)
+            w_end = min(len(onset_env), b_idx + 3)
+            beat_strengths.append(float(np.max(onset_env[w_start:w_end])))
+        else:
+            beat_strengths.append(0.0)
+    beat_strengths = np.array(beat_strengths)
+
+    # Mudança harmônica via Chroma nos beats
+    try:
+        chroma = librosa.feature.chroma_cqt(y=y_harm, sr=sr, hop_length=hop_length)
+        chroma_beats = librosa.util.sync(chroma, beats)
+        # Distância euclidiana entre frames de chroma consecutivos sincronizados
+        diff_chroma = np.sqrt(np.sum(np.diff(chroma_beats, axis=1)**2, axis=0))
+        diff_chroma = np.pad(diff_chroma, (1, 0), mode='edge')
+        diff_chroma = diff_chroma / (np.max(diff_chroma) + 1e-8)
+    except Exception:
+        diff_chroma = np.zeros(len(beats))
+
+    def _avaliar_fase_e_acentos(periodo):
+        melhor_fase = 0
+        melhor_score_fase = -1.0
+        melhor_h_score = 0.0
+
+        for fase in range(periodo):
+            indices = np.arange(fase, len(beats), periodo)
+            if len(indices) < 2:
+                continue
+            downbeat_accents = beat_strengths[indices]
+            other_accents = np.delete(beat_strengths, indices)
+
+            media_down = np.mean(downbeat_accents) if len(downbeat_accents) > 0 else 0.0
+            media_outros = np.mean(other_accents) if len(other_accents) > 0 else 0.0
+            score_acc = max(0.0, media_down - media_outros * 0.7)
+
+            # Mudança harmônica no downbeat
+            h_acc = np.mean(diff_chroma[indices]) if len(indices) > 0 else 0.0
+
+            comb_fase = score_acc * 0.7 + h_acc * 0.3
+            if comb_fase > melhor_score_fase:
+                melhor_score_fase = comb_fase
+                melhor_fase = fase
+                melhor_h_score = h_acc
+
+        return max(0.0, melhor_score_fase), melhor_fase, melhor_h_score
+
+    acc_2, f_2, h_2 = _avaliar_fase_e_acentos(2)
+    acc_3, f_3, h_3 = _avaliar_fase_e_acentos(3)
+    acc_4, f_4, h_4 = _avaliar_fase_e_acentos(4)
+    acc_6, f_6, h_6 = _avaliar_fase_e_acentos(2) # 6/8 tem 2 pulsos compostos
+
+    best_phase["2/4"] = f_2
+    best_phase["3/4"] = f_3
+    best_phase["4/4"] = f_4
+    best_phase["6/8"] = f_6
+
+    # 3. Recorrência / Beat Similarity Simplificada (Para desempate 2/4 vs 4/4)
+    rec_2 = 0.5
+    rec_4 = 0.5
+    if len(beats) >= 16:
+        try:
+            # Matriz de similaridade cosseno de chroma_beats
+            norm_chroma = chroma_beats / (np.linalg.norm(chroma_beats, axis=0, keepdims=True) + 1e-8)
+            sim_matrix = np.dot(norm_chroma.T, norm_chroma)
+            # Avalia autocorrelação de diagonais em lag=2 e lag=4
+            n_diag = min(len(sim_matrix), 32)
+            diag_2 = [sim_matrix[i, i+2] for i in range(n_diag - 2)]
+            diag_4 = [sim_matrix[i, i+4] for i in range(n_diag - 4)]
+            mean_d2 = float(np.mean(diag_2)) if diag_2 else 0.5
+            mean_d4 = float(np.mean(diag_4)) if diag_4 else 0.5
+            total_rec = mean_d2 + mean_d4 + 1e-8
+            rec_2 = mean_d2 / total_rec
+            rec_4 = mean_d4 / total_rec
+        except Exception:
+            pass
+
+    # Consolidação dos Scores Multifatoriais do Segmento
+    w = PESOS_DETECCAO_METRICA
+    raw_scores = {
+        "2/4": w["w_periodicity"] * p_2_4 + w["w_accent_phase"] * acc_2 + w["w_harmonic_change"] * h_2 + w["w_recurrence"] * rec_2,
+        "3/4": w["w_periodicity"] * p_3_4 + w["w_accent_phase"] * acc_3 + w["w_harmonic_change"] * h_3 + w["w_recurrence"] * 0.5,
+        "4/4": w["w_periodicity"] * p_4_4 + w["w_accent_phase"] * acc_4 + w["w_harmonic_change"] * h_4 + w["w_recurrence"] * rec_4,
+        "6/8": w["w_periodicity"] * p_6_8 + w["w_accent_phase"] * acc_6 + w["w_harmonic_change"] * h_6 + w["w_recurrence"] * 0.5,
+    }
+
+    # Normalização
+    s_soma = sum(raw_scores.values()) + 1e-8
+    for c in candidates:
+        scores[c] = float(raw_scores[c] / s_soma)
+
+    return scores, best_phase
+
+
+def detect_time_signature_light(y, sr, bpm):
+    """
+    Motor híbrido leve de detecção métrica multi-segmento.
+    Retorna métrica detectada, confiança, scores e auditoria completa.
+    """
+    total_len = len(y)
+    total_sec = total_len / float(sr)
+
+    # Três regiões representativas: 20%, 50% e 80%
+    window_sec = 18.0
+    window_samples = int(window_sec * sr)
+
+    positions = [0.20, 0.50, 0.80]
+    segment_scores = []
+    segment_phases = []
+    segment_winners = []
+
+    print(f"\n[Meter Detection] BPM: {bpm} | Duração: {total_sec:.1f}s")
+
+    for idx, pos in enumerate(positions):
+        center_sample = int(pos * total_len)
+        start_s = max(0, center_sample - window_samples // 2)
+        end_s = min(total_len, start_s + window_samples)
+        y_seg = y[start_s:end_s]
+
+        s_scores, s_phases = _analisar_segmento_metrico(y_seg, sr, bpm)
+        segment_scores.append(s_scores)
+        segment_phases.append(s_phases)
+        
+        # Vencedor local
+        winner = max(s_scores.items(), key=lambda kv: kv[1])[0]
+        segment_winners.append(winner)
+
+        print(
+            f"  Segmento {idx + 1} (~{int(pos*100)}%): "
+            f"2/4={s_scores['2/4']:.3f} | 3/4={s_scores['3/4']:.3f} | "
+            f"4/4={s_scores['4/4']:.3f} | 6/8={s_scores['6/8']:.3f} -> Líder: {winner}"
+        )
+
+    # Média agregada ponderada dos segmentos
+    candidates = ["2/4", "3/4", "4/4", "6/8"]
+    global_scores = {c: 0.0 for c in candidates}
+    for c in candidates:
+        valores = [seg[c] for seg in segment_scores]
+        global_scores[c] = float(np.mean(valores))
+
+    # Concordância entre segmentos
+    most_common_winner = max(set(segment_winners), key=segment_winners.count)
+    agreement_count = segment_winners.count(most_common_winner)
+    agreement_ratio = agreement_count / float(len(segment_winners))
+
+    # Bônus de consistência inter-segmentos
+    for c in candidates:
+        if c == most_common_winner:
+            global_scores[c] += PESOS_DETECCAO_METRICA["w_segment_consistency"] * agreement_ratio
+
+    # Normalização final dos scores globais
+    g_soma = sum(global_scores.values()) + 1e-8
+    for c in candidates:
+        global_scores[c] = float(global_scores[c] / g_soma)
+
+    # Ranking
+    ranking = sorted(global_scores.items(), key=lambda kv: kv[1], reverse=True)
+    best_cand, best_score = ranking[0]
+    second_cand, second_score = ranking[1]
+    margin = best_score - second_score
+
+    # Decisão de Confiança e Política de Abstention
+    limiar_margem = PESOS_DETECCAO_METRICA["limiar_margem_ambiguidade"]
+    
+    if margin >= limiar_margem and agreement_ratio >= 0.66:
+        confidence_label = "alta"
+        status = "detected"
+        detected_time_sig = best_cand
+    elif margin >= (limiar_margem * 0.6) and agreement_ratio >= 0.66:
+        confidence_label = "média"
+        status = "detected"
+        detected_time_sig = best_cand
+    else:
+        confidence_label = "inconclusiva"
+        status = "ambiguous"
+        detected_time_sig = "4/4"  # Fallback técnico seguro para não paralisar o pipeline
+
+    chosen_phase = segment_phases[1].get(best_cand, 0)
+
+    print(
+        f"[Meter Detection] Resultado Global:\n"
+        f"  Scores: 2/4={global_scores['2/4']:.3f} | 3/4={global_scores['3/4']:.3f} | "
+        f"4/4={global_scores['4/4']:.3f} | 6/8={global_scores['6/8']:.3f}\n"
+        f"  Melhor: {best_cand} ({best_score:.3f}) | Segundo: {second_cand} ({second_score:.3f}) | "
+        f"Margem: {margin:.3f} | Concordância: {agreement_ratio:.0%} | "
+        f"Confiança: {confidence_label} | Fase: {chosen_phase} | Status: {status}\n"
+    )
+
+    return {
+        "time_sig": detected_time_sig,
+        "status": status,
+        "best_cand": best_cand,
+        "best_score": round(best_score, 3),
+        "second_cand": second_cand,
+        "second_score": round(second_score, 3),
+        "margin": round(margin, 3),
+        "segment_agreement": round(agreement_ratio, 2),
+        "confidence_label": confidence_label,
+        "chosen_phase": chosen_phase,
+        "scores": {k: round(v, 3) for k, v in global_scores.items()}
+    }
+
+
+# ---------------------------------------------------------
+# 3. CONVERSORES SEGUROS E SANITIZADORES
 # ---------------------------------------------------------
 def format_root_pt_br(pitch_name: str) -> str:
     """Converte flats do music21 ('B-', 'E-') para o padrão de cifra ('Bb', 'Eb')."""
@@ -327,7 +622,7 @@ def auditar_e_sanitizar_duracoes_musicxml(stream_obj):
 
 
 # ---------------------------------------------------------
-# CABEÇALHO E INTERFACE WEB
+# 4. CABEÇALHO E INTERFACE WEB
 # ---------------------------------------------------------
 st.title("🎵 Partitura.ai")
 st.markdown("### Sua Música em Partitura com Melodia e Cifras Harmônicas")
@@ -339,7 +634,7 @@ with st.sidebar:
         "Fórmula de Compasso:",
         ["Automático", "2/4", "3/4", "4/4", "6/8"],
         index=0,
-        help="No modo Automático, o sistema estima o compasso. Se conhecer a métrica exata da obra, selecione manualmente."
+        help="No modo Automático, o sistema executa detecção híbrida inteligente. Se conhecer o compasso de antemão, selecione manualmente."
     )
 
 uploaded_file = st.file_uploader("Escolha um arquivo de áudio", type=["mp3", "wav", "m4a", "flac", "ogg"])
@@ -348,6 +643,7 @@ if uploaded_file is not None:
     st.audio(uploaded_file.getvalue())
     
     if st.button("✨ Gerar Partitura Completa com Cifras", type="primary"):
+        # Limpeza preventiva do session_state antes de iniciar nova transcrição
         for k in ["result_ready", "midi_bytes", "xml_bytes", "pdf_bytes", "page_images", "info_text"]:
             if k in st.session_state:
                 del st.session_state[k]
@@ -358,7 +654,7 @@ if uploaded_file is not None:
         session_dir = UPLOAD_DIR / f"session_{session_id}"
         session_dir.mkdir(exist_ok=True)
 
-        with st.spinner("⚡ Processando áudio no Render (compilando LilyPond e IA)... Por favor, aguarde alguns instantes."):
+        with st.spinner("⚡ Processando áudio no Render (análise métrica, IA e LilyPond)... Aguarde."):
             try:
                 ai_model = get_inference_model()
 
@@ -368,6 +664,7 @@ if uploaded_file is not None:
                 y_full, sr = librosa.load(str(safe_input_path), sr=22050, mono=True)
                 total_duration = len(y_full) / sr
 
+                # Detecção e normalização robusta de BPM
                 sample_limit = min(len(y_full), int(45.0 * sr))
                 onset_env = librosa.onset.onset_strength(y=y_full[:sample_limit], sr=sr)
                 tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
@@ -382,16 +679,26 @@ if uploaded_file is not None:
                     bpm *= 2.0
                 bpm = round(bpm, 1)
 
+                del onset_env
+                gc.collect()
+
+                # ---------------------------------------------------------
+                # DETERMINAÇÃO DO COMPASSO (TESTE A2)
+                # ---------------------------------------------------------
                 if compasso_selecionado != "Automático":
                     time_sig = compasso_selecionado
                     compasso_exibicao = f"{time_sig} (Manual)"
                 else:
-                    time_sig = "2/4" if bpm >= 128.0 else "4/4"
-                    compasso_exibicao = f"{time_sig} (Automático)"
+                    # Executa análise métrica híbrida multi-segmento
+                    res_meter = detect_time_signature_light(y_full, sr, bpm)
+                    if res_meter["status"] == "detected":
+                        time_sig = res_meter["time_sig"]
+                        compasso_exibicao = f"{time_sig} (Auto - Confiança {res_meter['confidence_label']})"
+                    else:
+                        time_sig = "4/4"  # Fallback técnico seguro para construção da partitura
+                        compasso_exibicao = "Não determinado (fallback 4/4)"
 
-                del onset_env
-                gc.collect()
-
+                # Inferência do Basic Pitch em blocos de 60s
                 chunk_duration = 60.0
                 all_notes = []
                 start_time = 0.0
@@ -442,10 +749,13 @@ if uploaded_file is not None:
 
                     if not melody_clusters:
                         st.warning(
-                            "Foram detectadas notas no áudio, mas nenhuma atingiu os limiares do filtro melódico principal "
-                            "(altura ou intensidade mínimas). Tente enviar uma gravação com a melodia mais destacada."
+                            "Foram detectadas notas no áudio, mas nenhuma atingiu os limiares do filtro melódico do Teste A. "
+                            "Ajuste os filtros ou selecione o modo manual se necessário."
                         )
                     else:
+                        # ---------------------------------------------------------
+                        # EXPORTAÇÃO MIDI (Usa estritamente segundos: start_sec / end_sec)
+                        # ---------------------------------------------------------
                         midi_path = OUTPUT_DIR / f"partitura_{session_id}.mid"
                         pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
                         inst = pretty_midi.Instrument(program=0)
@@ -460,6 +770,9 @@ if uploaded_file is not None:
                         pm.instruments.append(inst)
                         pm.write(str(midi_path))
 
+                        # ---------------------------------------------------------
+                        # CONSTRUÇÃO DO SCORE NO MUSIC21 (Usa estritamente QuarterLength)
+                        # ---------------------------------------------------------
                         score = music21.stream.Score()
                         score.insert(0, music21.metadata.Metadata())
                         score.metadata.title = os.path.splitext(uploaded_file.name)[0]
@@ -498,13 +811,16 @@ if uploaded_file is not None:
                             el.quarterLength = dur_ql
                             part.insert(float(start_ql), el)
 
+                        # Detecção Tonal Global com fallback seguro
                         detected_key, key_success = detectar_centro_tonal_global(part)
                         part.insert(0, music21.key.KeySignature(detected_key.sharps))
                         
+                        # Sequência Canônica: makeMeasures -> makeTies -> Auditoria
                         part.makeMeasures(inPlace=True)
                         part.makeTies(inPlace=True)
                         auditar_e_sanitizar_duracoes_musicxml(part)
 
+                        # Extração e ancoragem das cifras por compasso
                         measures = list(part.getElementsByClass(music21.stream.Measure))
                         xml_chords_to_insert = []
                         last_mpb_sym = None
@@ -532,6 +848,9 @@ if uploaded_file is not None:
 
                         score.insert(0, part)
 
+                        # ---------------------------------------------------------
+                        # ETAPA 1: Renderização em PDF via LilyPond (Sem Duration 0.0)
+                        # ---------------------------------------------------------
                         pdf_bytes = None
                         page_images = []
                         try:
@@ -556,6 +875,9 @@ if uploaded_file is not None:
                                 "O processamento do MIDI e do MusicXML continuará normalmente."
                             )
 
+                        # ---------------------------------------------------------
+                        # ETAPA 2: Inserção de ChordSymbol com Log e Exportação MusicXML
+                        # ---------------------------------------------------------
                         for m_obj, mpb_sym, xml_sym in xml_chords_to_insert:
                             try:
                                 cs_obj = music21.harmony.ChordSymbol(xml_sym)
