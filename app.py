@@ -368,7 +368,6 @@ if uploaded_file is not None:
                         cluster = melody_clusters[start_ql]
                         raw_dur_ql = max((c.end - c.start) / sec_per_quarter for c in cluster)
                         
-                        # SANITIZAÇÃO DE DURAÇÃO: Arredonda rigorosamente para múltiplos válidos (0.25, 0.5, 1.0, etc.)
                         dur_ql = round(raw_dur_ql * 4) / 4.0
                         if dur_ql <= 0:
                             dur_ql = 0.25
@@ -389,10 +388,16 @@ if uploaded_file is not None:
                         el.quarterLength = dur_ql
                         part.insert(start_ql, el)
 
+                    # BLINDAGEM DE DURAÇÕES: Força todas as notas e pausas a terem durações estritamente expressíveis
+                    for el in part.recurse().notesAndRests:
+                        if el.quarterLength:
+                            el.quarterLength = round(el.quarterLength * 4) / 4.0
+                            if el.quarterLength <= 0:
+                                el.quarterLength = 0.25
+
                     detected_key = detectar_centro_tonal_global(part)
                     part.insert(0, music21.key.KeySignature(detected_key.sharps))
                     
-                    # BLINDAGEM DE COMPASSOS: Garante que o music21 não gere durações inexpressíveis
                     try:
                         part.makeMeasures(inPlace=True, strictPadding=False)
                     except Exception:
@@ -453,11 +458,15 @@ if uploaded_file is not None:
                         except Exception:
                             pass
 
+                    # Limpeza final de durações residuais antes da gravação do XML
+                    for n in score.recurse().notesAndRests:
+                        if n.quarterLength <= 0:
+                            n.quarterLength = 0.25
+
                     xml_path = OUTPUT_DIR / f"partitura_{session_id}.musicxml"
                     try:
                         score.write('musicxml', fp=str(xml_path))
                     except Exception:
-                        # Fallback seguro caso ocorra incompatibilidade extrema de oitava no XML
                         part.write('musicxml', fp=str(xml_path))
 
                     tonica_map = {'C': 'Dó', 'C#': 'Dó#', 'D': 'Ré', 'E': 'Mi', 'F': 'Fá', 'G': 'Sol', 'A': 'Lá', 'B': 'Si'}
