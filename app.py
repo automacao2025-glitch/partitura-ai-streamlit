@@ -85,7 +85,7 @@ OUTPUT_DIR = Path("temp_outputs")
 for d in [UPLOAD_DIR, OUTPUT_DIR]:
     d.mkdir(exist_ok=True)
 
-APP_VERSION = "A4.1-Optimized-Hierarchical-Inference"
+APP_VERSION = "A4.2.1-Hierarchical-Pulse-Bar-RawGrid-Calibrated"
 
 # ---------------------------------------------------------
 # 1. SISTEMA DE AUDITORIA E LOG TÉCNICO
@@ -156,29 +156,38 @@ CONFIG_TACTUS = {
 }
 
 CONFIG_METER = {
-    "w_periodicity": 0.24,
-    "w_accent": 0.24,
-    "w_subdivision": 0.18,
-    "w_harmonic_change": 0.12,
-    "w_recurrence": 0.12,
-    "w_bass": 0.10,
-    "beat3_continuation_threshold": 0.52,
+    # Pesos de evidência. Todos são multiplicados pela reliability da própria feature.
+    "w_periodicity": 0.20,
+    "w_accent": 0.18,
+    "w_structure": 0.18,
+    "w_subdivision": 0.16,
+    "w_harmonic_change": 0.10,
+    "w_recurrence": 0.10,
+    "w_bass": 0.08,
+    # O motor A4.2 separa TATUM -> PULSE -> BAR; não usa um threshold isolado para 2/4 x 4/4.
     "ternary_phase_bins": 12,
-    "viterbi_self_transition": 0.82,
+    "viterbi_self_transition": 0.84,
     "viterbi_section_min_windows": 2,
+    # Temperatura da marginalização de tactus. Menor = privilegia evidência forte sem descartar rivais plausíveis.
+    "tactus_softmax_temperature": 0.085,
+    # Priors estruturais fracos, usados só como regularização contínua.
+    "recurrence_2bar_center": 0.72,
+    "recurrence_2bar_scale": 0.075,
 }
 
 CONFIG_CONFIDENCE = {
-    "bootstrap_iterations": 40,
-    "min_decision_quality": 0.50,
-    "min_bootstrap_stability": 0.58,
-    "min_feature_agreement": 0.42,
-    "min_grouping_quality": 0.055,
-    "min_subdivision_quality": 0.075,
-    "min_decision_specific_quality": 0.075,
-    "base_margin_threshold": 0.060,
-    "min_margin_abs": 0.060,
+    "bootstrap_iterations": 48,
+    "min_decision_quality": 0.48,
+    "min_bootstrap_stability": 0.56,
+    "min_feature_agreement": 0.36,
+    "min_grouping_quality": 0.035,
+    "min_subdivision_quality": 0.055,
+    "min_decision_specific_quality": 0.055,
+    "base_margin_threshold": 0.045,
+    "min_margin_abs": 0.045,
     "max_margin_abs": 0.150,
+    # Confiança do compasso e confiança do tactus são independentes no A4.2.
+    "min_meter_confidence": 0.50,
 }
 
 CONFIG_MELODY = {
@@ -644,78 +653,172 @@ def seconds_to_musical_position(time_sec: float, beat_times: np.ndarray, pulse_q
 # ---------------------------------------------------------
 # 7. MOTOR DE COMPASSO HIERÁRQUICO, VITERBI E BOOTSTRAP
 # ---------------------------------------------------------
-def _compute_inner_pulse_subdivision(onset_peaks_times, beat_times_seg):
-    n_bins = CONFIG_METER["ternary_phase_bins"]
+def _sigmoid(x: float) -> float:
+    x = float(np.clip(x, -30.0, 30.0))
+    return float(1.0 / (1.0 + math.exp(-x)))
+
+
+def _robust_unit(x):
+    arr = np.asarray(x, dtype=float)
+    if arr.size == 0:
+        return arr
+    lo, hi = np.percentile(arr, [10, 90])
+    if hi <= lo + 1e-9:
+        return np.zeros_like(arr)
+    return np.clip((arr - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+
+
+def _shape_similarity(values, template):
+    """Similaridade de forma (0..1), removendo o nível DC para não premiar vetores quase planos."""
+    a = np.asarray(values, dtype=float)
+    b = np.asarray(template, dtype=float)
+    if a.size != b.size or a.size < 2:
+        return 0.5
+    a = a - np.mean(a)
+    b = b - np.mean(b)
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    if na < 1e-8 or nb < 1e-8:
+        return 0.5
+    corr = float(np.dot(a, b) / (na * nb))
+    return float(np.clip(0.5 + 0.5 * corr, 0.0, 1.0))
+
+
+def _best_bar_template(series, template):
+    """Retorna score, fase e médias por papel métrico para um template de barra."""
+    x = np.asarray(series, dtype=float)
+    tpl = np.asarray(template, dtype=float)
+    n = len(tpl)
+    if len(x) < max(6, n * 3):
+        return 0.5, 0, np.full(n, np.mean(x) if len(x) else 0.0)
+    best = (-1.0, 0, None)
+    idx = np.arange(len(x))
+    for phase in range(n):
+        roles = (idx - phase) % n
+        means = np.array([np.mean(x[roles == j]) if np.any(roles == j) else 0.0 for j in range(n)])
+        shape = _shape_similarity(means, tpl)
+        scale = np.std(means) + 0.08
+        contrast = (means[0] - np.mean(means[1:])) / scale
+        contrast_sc = _sigmoid(1.15 * contrast)
+        score = 0.62 * shape + 0.38 * contrast_sc
+        if score > best[0]:
+            best = (float(score), int(phase), means)
+    return best
+
+
+def _compute_pulse_phase_features(env, beat_frames):
+    """
+    Mede a organização *dentro* do pulso candidato.
+    Isso é condicionado ao tactus: o mesmo áudio pode ser binário em um nível e ternário em outro.
+    """
+    n_bins = int(CONFIG_METER["ternary_phase_bins"])
+    env = np.asarray(env, dtype=float)
+    beat_frames = np.asarray(beat_frames, dtype=int)
+    if len(beat_frames) < 5:
+        return {
+            "p_bin": 0.5, "p_tern": 0.5, "reliability": 0.0, "ternary_repeat": 0.0,
+            "half_ratio": 1.0, "third_ratio": 1.0, "compound_support": 0.5,
+        }
+
+    pulse_hists = []
+    tern_wins = 0
+    valid = 0
+    beat_start_strength = []
+    half_strength = []
+    third_strength = []
+
+    # Templates internos: binário = meio; ternário = 1/3 + 2/3.
     tpl_bin = np.zeros(n_bins, dtype=float)
     tpl_tern = np.zeros(n_bins, dtype=float)
+    for k, v in [(n_bins // 2, 1.0), (n_bins // 2 - 1, 0.35), (n_bins // 2 + 1, 0.35)]:
+        tpl_bin[k % n_bins] = max(tpl_bin[k % n_bins], v)
+    for base in (n_bins // 3, (2 * n_bins) // 3):
+        tpl_tern[base] = 1.0
+        tpl_tern[(base - 1) % n_bins] = max(tpl_tern[(base - 1) % n_bins], 0.30)
+        tpl_tern[(base + 1) % n_bins] = max(tpl_tern[(base + 1) % n_bins], 0.30)
 
-    for idx_b in [0, n_bins // 2]:
-        tpl_bin[idx_b] = 1.0
-        tpl_bin[(idx_b - 1) % n_bins] = 0.25
-        tpl_bin[(idx_b + 1) % n_bins] = 0.25
-
-    for idx_t in [0, n_bins // 3, (2 * n_bins) // 3]:
-        tpl_tern[idx_t] = 1.0
-        tpl_tern[(idx_t - 1) % n_bins] = 0.20
-        tpl_tern[(idx_t + 1) % n_bins] = 0.20
-
-    if len(beat_times_seg) < 4 or len(onset_peaks_times) < 4:
-        return 0.52, 0.48, 0.0, 0.0
-
-    hist_global = np.zeros(n_bins, dtype=float)
-    bar_ternary_wins = 0
-    valid_pulses = 0
-
-    for i in range(len(beat_times_seg) - 1):
-        b0, b1 = beat_times_seg[i], beat_times_seg[i + 1]
-        dur = b1 - b0
-        if dur <= 0.12:
+    for a, b in zip(beat_frames[:-1], beat_frames[1:]):
+        if b - a < max(6, n_bins // 2):
             continue
-        p_in = onset_peaks_times[(onset_peaks_times >= b0) & (onset_peaks_times < b1)]
-        if len(p_in) < 2:
+        edges = np.linspace(a, b, n_bins + 1).astype(int)
+        h = np.zeros(n_bins, dtype=float)
+        for i in range(n_bins):
+            lo = max(0, int(edges[i]))
+            hi = min(len(env), max(lo + 1, int(edges[i + 1])))
+            h[i] = float(np.max(env[lo:hi])) if hi > lo else 0.0
+        mx = float(np.max(h))
+        if mx <= 1e-8:
             continue
-        phases = (p_in - b0) / dur
-        h_pulse, _ = np.histogram(phases, bins=n_bins, range=(0.0, 1.0))
-        hist_global += h_pulse
-        valid_pulses += 1
-        if cosine_sim(h_pulse.astype(float), tpl_tern) > cosine_sim(h_pulse.astype(float), tpl_bin) + 0.04:
-            bar_ternary_wins += 1
+        hn = h / mx
+        pulse_hists.append(hn)
+        valid += 1
+        # Ignora bin 0 na comparação interna; ele representa o próprio pulso.
+        h_internal = hn.copy()
+        h_internal[0] = 0.0
+        sb = cosine_sim(h_internal, tpl_bin)
+        st = cosine_sim(h_internal, tpl_tern)
+        if st > sb + 0.035:
+            tern_wins += 1
+        beat_start_strength.append(float(np.mean(hn[:2])))
+        half_strength.append(float(np.mean(hn[max(0, n_bins//2-1):min(n_bins, n_bins//2+2)])))
+        t1 = float(np.mean(hn[max(0, n_bins//3-1):min(n_bins, n_bins//3+2)]))
+        t2 = float(np.mean(hn[max(0, 2*n_bins//3-1):min(n_bins, 2*n_bins//3+2)]))
+        third_strength.append(min(t1, t2))
 
-    if np.sum(hist_global) <= 0:
-        return 0.52, 0.48, 0.0, 0.0
+    if not pulse_hists:
+        return {
+            "p_bin": 0.5, "p_tern": 0.5, "reliability": 0.0, "ternary_repeat": 0.0,
+            "half_ratio": 1.0, "third_ratio": 1.0, "compound_support": 0.5,
+        }
 
-    sim_bin = cosine_sim(hist_global, tpl_bin)
-    sim_tern = cosine_sim(hist_global, tpl_tern)
+    hmean = np.mean(np.asarray(pulse_hists), axis=0)
+    h_internal = hmean.copy()
+    h_internal[0] = 0.0
+    sim_bin = max(1e-6, cosine_sim(h_internal, tpl_bin))
+    sim_tern = max(1e-6, cosine_sim(h_internal, tpl_tern))
+    p_tern = float(sim_tern / (sim_bin + sim_tern))
+    p_bin = 1.0 - p_tern
+    repeat = tern_wins / float(max(1, valid))
 
-    inner_tern_support = min(hist_global[n_bins // 3], hist_global[(2 * n_bins) // 3]) / (np.max(hist_global) + 1e-8)
-    rep_ratio = bar_ternary_wins / float(max(1, valid_pulses))
+    start = float(np.mean(beat_start_strength)) + 1e-8
+    half_ratio = float(np.clip(np.mean(half_strength) / start, 0.0, 2.0))
+    third_ratio = float(np.clip(np.mean(third_strength) / start, 0.0, 2.0))
 
-    if inner_tern_support < 0.15 or rep_ratio < 0.28:
-        sim_tern *= 0.78
+    # Em 6/8 real, a energia em 1/3 e 2/3 deve ser repetida e relativamente maior que a de 1/2.
+    phase_margin = float(np.clip((third_ratio - half_ratio + 0.35) / 0.70, 0.0, 1.0))
+    repeat_sc = float(np.clip((repeat - 0.18) / 0.52, 0.0, 1.0))
+    tern_sc = float(np.clip((p_tern - 0.46) / 0.24, 0.0, 1.0))
+    compound_support = float(np.clip(0.40 * tern_sc + 0.35 * repeat_sc + 0.25 * phase_margin, 0.0, 1.0))
+    rel = float(np.clip(0.55 * binary_reliability(p_tern) + 0.45 * abs(third_ratio - half_ratio), 0.0, 1.0))
 
-    tot = sim_bin + sim_tern + 1e-8
-    p_bin = sim_bin / tot
-    p_tern = sim_tern / tot
-    rel = binary_reliability(p_bin)
-    return float(p_bin), float(p_tern), float(rel), float(rep_ratio)
+    return {
+        "p_bin": p_bin,
+        "p_tern": p_tern,
+        "reliability": rel,
+        "ternary_repeat": repeat,
+        "half_ratio": half_ratio,
+        "third_ratio": third_ratio,
+        "compound_support": compound_support,
+    }
 
 
 def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onset_peaks_times, seg_notes):
     hop = CONFIG_SIGNAL["hop_length"]
-    env = seg["onset_env"]
+    env = np.asarray(seg["onset_env"], dtype=float)
     if len(env) < 16:
         return None
 
     _, beats = librosa.beat.beat_track(onset_envelope=env, sr=sr, hop_length=hop, bpm=cand_bpm)
+    beats = np.asarray(beats, dtype=int)
     if len(beats) < 6:
         step_f = max(2, int(round((60.0 / cand_bpm * sr) / hop)))
-        beats = np.arange(0, len(env), step_f)
+        beats = np.arange(0, len(env), step_f, dtype=int)
     if len(beats) < 6:
         return None
 
     beat_times_local = librosa.frames_to_time(beats + seg["frame_start"], sr=sr, hop_length=hop)
     frames_per_beat = max(2, int(round((60.0 / cand_bpm * sr) / hop)))
 
+    # ---------------- periodicidade 2/3/4 ----------------
     ac = seg.get("tempogram_ac")
     if ac is None or len(ac) < 2:
         tg = librosa.feature.tempogram(onset_envelope=env, sr=sr, hop_length=hop)
@@ -728,26 +831,27 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
             return float(np.max(ac[max(1, lg - 1):min(len(ac), lg + 2)]))
         return 0.0
 
-    per_raw = {2: _lag_e(2.0), 3: _lag_e(3.0), 4: _lag_e(4.0)}
-    per_sum = sum(per_raw.values()) + 1e-8
-    per_probs = {k: v / per_sum for k, v in per_raw.items()}
+    per_abs = {2: _lag_e(2.0), 3: _lag_e(3.0), 4: _lag_e(4.0)}
+    per_sum = sum(per_abs.values()) + 1e-8
+    per_probs = {k: v / per_sum for k, v in per_abs.items()}
     per_rel = multiclass_reliability(per_probs)
 
+    # ---------------- ataques nos beats ----------------
     b_acc = np.array([
         float(np.max(env[max(0, int(b) - 2):min(len(env), int(b) + 3)]))
         for b in beats
     ], dtype=float)
+    b_acc_u = _robust_unit(b_acc)
     b_z = (b_acc - np.mean(b_acc)) / (np.std(b_acc) + 1e-8)
 
+    # ---------------- mudança harmônica e recorrência absolutas ----------------
     try:
         chroma = seg.get("chroma")
         if chroma is None:
             chroma = librosa.feature.chroma_cqt(y=y_harm_seg, sr=sr, hop_length=hop)
-        # beat frames são locais ao segmento; limita índices ao domínio do chroma.
-        beats_sync = np.asarray(beats, dtype=int)
-        beats_sync = beats_sync[(beats_sync >= 0) & (beats_sync < chroma.shape[1])]
+        beats_sync = beats[(beats >= 0) & (beats < chroma.shape[1])]
         if len(beats_sync) < 2:
-            raise ValueError("Poucos beats válidos para sincronização de chroma")
+            raise ValueError("Poucos beats válidos")
         c_sync = librosa.util.sync(chroma, beats_sync)
         c_norm = c_sync / (np.linalg.norm(c_sync, axis=0, keepdims=True) + 1e-8)
         h_diff = np.sqrt(np.sum(np.diff(c_norm, axis=1) ** 2, axis=0))
@@ -757,185 +861,232 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
         c_norm = np.zeros((12, len(beats)))
         h_diff = np.zeros(len(beats))
 
+    # ---------------- baixo e ataques simbólicos (Basic Pitch) ----------------
     bass_beat_env = np.zeros(len(beat_times_local), dtype=float)
+    note_attack_env = np.zeros(len(beat_times_local), dtype=float)
     if seg_notes:
+        pitches = np.array([n.pitch for n in seg_notes], dtype=float)
+        high_cut = float(np.percentile(pitches, 60)) if len(pitches) else 64.0
         for bi, bt in enumerate(beat_times_local):
-            low_n = [n for n in seg_notes if n.pitch <= 55 and abs(n.start_sec - bt) <= 0.14]
-            if low_n:
-                bass_beat_env[bi] = max(n.velocity / 127.0 for n in low_n)
+            near = [n for n in seg_notes if abs(n.start_sec - bt) <= 0.14]
+            lows = [n for n in near if n.pitch <= 55]
+            highs = [n for n in near if n.pitch >= high_cut]
+            if lows:
+                bass_beat_env[bi] = max(n.velocity / 127.0 for n in lows)
+            if highs:
+                note_attack_env[bi] = max((n.velocity / 127.0) * min(1.0, 0.35 + n.duration_sec) for n in highs)
 
+    # ---------------- templates 2/3/4 por fonte ----------------
     templates_acc = {
-        2: np.array([1.0, -0.85]),
-        3: np.array([1.0, -0.50, -0.50]),
-        4: np.array([1.0, -0.60, 0.35, -0.60]),
+        2: np.array([1.0, -0.82]),
+        3: np.array([1.0, -0.52, -0.48]),
+        4: np.array([1.0, -0.62, 0.30, -0.58]),
     }
-
-    acc_probs = {}
-    harm_probs = {}
-    bass_probs = {}
-    best_phases = {}
-
+    acc_probs, harm_probs, bass_probs, best_phases = {}, {}, {}, {}
+    acc_abs = {}
     for p_n, tpl in templates_acc.items():
-        best_f = 0
-        best_comb = -1e9
-        best_a = 0.0
-        best_h = 0.0
-        best_b = 0.0
-        for f in range(p_n):
+        best = None
+        for phase in range(p_n):
             idx_seq = np.arange(len(beats))
-            roles = (idx_seq - f) % p_n
+            roles = (idx_seq - phase) % p_n
             a_val = float(np.mean(b_z * tpl[roles]))
             down_i = idx_seq[roles == 0]
-            h_val = float(np.mean(h_diff[down_i])) if len(down_i) > 0 else 0.0
-            b_val = float(np.mean(bass_beat_env[down_i])) if len(down_i) > 0 else 0.0
-            comb = 0.55 * a_val + 0.25 * h_val + 0.20 * b_val
-            if comb > best_comb:
-                best_comb = comb
-                best_f = f
-                best_a = a_val
-                best_h = h_val
-                best_b = b_val
-        acc_probs[p_n] = float(1.0 / (1.0 + math.exp(-2.2 * best_a)))
-        harm_probs[p_n] = float(best_h)
-        bass_probs[p_n] = float(best_b)
-        best_phases[p_n] = int(best_f)
+            h_val = float(np.mean(h_diff[down_i])) if len(down_i) else 0.0
+            b_val = float(np.mean(bass_beat_env[down_i])) if len(down_i) else 0.0
+            n_val = float(np.mean(note_attack_env[down_i])) if len(down_i) else 0.0
+            comb = 0.48 * a_val + 0.23 * h_val + 0.17 * b_val + 0.12 * n_val
+            if best is None or comb > best[0]:
+                best = (comb, phase, a_val, h_val, b_val)
+        _, phase, a_val, h_val, b_val = best
+        acc_abs[p_n] = _sigmoid(2.0 * a_val)
+        acc_probs[p_n] = acc_abs[p_n]
+        harm_probs[p_n] = max(0.0, h_val)
+        bass_probs[p_n] = max(0.0, b_val)
+        best_phases[p_n] = int(phase)
 
     def _norm_dict(d):
-        s = sum(d.values()) + 1e-8
-        return {k: v / s for k, v in d.items()}
+        z = sum(max(0.0, float(v)) for v in d.values()) + 1e-8
+        return {k: max(0.0, float(v)) / z for k, v in d.items()}
 
     acc_probs = _norm_dict(acc_probs)
     harm_probs = _norm_dict(harm_probs)
     bass_probs = _norm_dict(bass_probs)
-
     acc_rel = multiclass_reliability(acc_probs)
     harm_rel = multiclass_reliability(harm_probs)
     bass_rel = multiclass_reliability(bass_probs)
 
-    rec_raw = {2: 0.33, 3: 0.33, 4: 0.33}
+    # ---------------- recorrência absoluta e relativa ----------------
+    rec_abs = {2: 0.50, 3: 0.50, 4: 0.50}
     if c_norm.shape[1] >= 10:
         sim_m = np.dot(c_norm.T, c_norm)
-        for lg in (2, 3, 4):
-            diags = [sim_m[i, i + lg] for i in range(sim_m.shape[0] - lg)]
-            rec_raw[lg] = float(np.clip(np.mean(diags), 0.01, 1.0)) if diags else 0.33
-    rec_probs = _norm_dict(rec_raw)
+        for lag in (2, 3, 4):
+            vals = [sim_m[i, i + lag] for i in range(sim_m.shape[0] - lag)]
+            rec_abs[lag] = float(np.clip(np.mean(vals), 0.0, 1.0)) if vals else 0.50
+    rec_probs = _norm_dict(rec_abs)
     rec_rel = multiclass_reliability(rec_probs)
 
-    f4 = best_phases[4]
-    idx_all = np.arange(len(beats))
-    b1_idx = idx_all[(idx_all - f4) % 4 == 0]
-    b3_idx = idx_all[(idx_all - f4) % 4 == 2]
+    # ---------------- força estrutural combinada por beat ----------------
+    L = min(len(b_acc_u), len(h_diff), len(bass_beat_env), len(note_attack_env))
+    if L <= 0:
+        return None
+    h_u = _robust_unit(h_diff[:L])
+    b_u = _robust_unit(bass_beat_env[:L])
+    n_u = _robust_unit(note_attack_env[:L])
+    struct = 0.46 * b_acc_u[:L] + 0.24 * h_u + 0.18 * b_u + 0.12 * n_u
 
-    beat3_is_continuation = 0.50
-    if len(b1_idx) >= 2 and len(b3_idx) >= 2:
-        h_b1 = float(np.mean(h_diff[b1_idx]))
-        h_b3 = float(np.mean(h_diff[b3_idx]))
-        a_b1 = float(np.mean(b_acc[b1_idx]))
-        a_b3 = float(np.mean(b_acc[b3_idx]))
-        bs_b1 = float(np.mean(bass_beat_env[b1_idx]))
-        bs_b3 = float(np.mean(bass_beat_env[b3_idx]))
+    struct_scores = {}
+    struct_phases = {}
+    role_means = {}
+    for g, tpl in {
+        2: [1.0, 0.30],
+        3: [1.0, 0.28, 0.33],
+        4: [1.0, 0.28, 0.62, 0.28],
+    }.items():
+        sc, ph, means = _best_bar_template(struct, tpl)
+        struct_scores[g] = sc
+        struct_phases[g] = ph
+        role_means[g] = means
+    struct_probs = _norm_dict(struct_scores)
+    struct_rel = multiclass_reliability(struct_probs)
 
-        asym_h = (h_b1 - h_b3) / (h_b1 + h_b3 + 1e-8)
-        asym_a = (a_b1 - a_b3) / (a_b1 + a_b3 + 1e-8)
-        asym_b = (bs_b1 - bs_b3) / (bs_b1 + bs_b3 + 1e-8)
-        asym_total = 0.45 * asym_h + 0.35 * asym_a + 0.20 * asym_b
-        beat3_is_continuation = float(np.clip(0.50 + 1.25 * asym_total, 0.05, 0.95))
+    # ---------------- 2/4 x 4/4: hierarquia do tempo 1 contra tempo 3 ----------------
+    means4 = np.asarray(role_means[4], dtype=float)
+    sim_4 = _shape_similarity(means4, [1.0, 0.28, 0.62, 0.28])
+    sim_2repeat = _shape_similarity(means4, [1.0, 0.28, 1.0, 0.28])
+    hierarchy_margin = float(sim_4 - sim_2repeat)
+    # Recorrência absoluta de 2 beats alta é evidência adicional de barra curta (2/4).
+    rec2_simple = _sigmoid((rec_abs[2] - CONFIG_METER["recurrence_2bar_center"]) / CONFIG_METER["recurrence_2bar_scale"])
+    four_hierarchy = float(np.clip(0.58 * _sigmoid(9.0 * hierarchy_margin) + 0.42 * (1.0 - rec2_simple), 0.0, 1.0))
+    two_hierarchy = 1.0 - four_hierarchy
+    hierarchy_quality = float(np.clip(abs(four_hierarchy - 0.5) * 2.0, 0.0, 1.0))
 
-    b3_rel = binary_reliability(beat3_is_continuation)
+    # ---------------- subdivisão condicionada ao tactus ----------------
+    phase = _compute_pulse_phase_features(env, beats)
+    p_sub_bin = phase["p_bin"]
+    p_sub_tern = phase["p_tern"]
+    sub_rel = phase["reliability"]
+    tern_rep = phase["ternary_repeat"]
+    compound_support = phase["compound_support"]
+    simple_support = 1.0 - compound_support
 
-    p_sub_bin, p_sub_tern, sub_rel, tern_rep = _compute_inner_pulse_subdivision(onset_peaks_times, beat_times_local)
-
+    # ---------------- grouping 2/3/4 com reliability real ----------------
     wm = CONFIG_METER
-    eps_rel = 1e-4
-    eff_w_per = wm["w_periodicity"] * max(eps_rel, per_rel)
-    eff_w_acc = wm["w_accent"] * max(eps_rel, acc_rel)
-    eff_w_harm = wm["w_harmonic_change"] * max(eps_rel, harm_rel)
-    eff_w_rec = wm["w_recurrence"] * max(eps_rel, rec_rel)
-    eff_w_bass = wm["w_bass"] * max(eps_rel, bass_rel)
-    w_sum_grp = eff_w_per + eff_w_acc + eff_w_harm + eff_w_rec + eff_w_bass + 1e-8
-
+    eps = 1e-5
+    eff = {
+        "periodicity": wm["w_periodicity"] * max(eps, per_rel),
+        "accent": wm["w_accent"] * max(eps, acc_rel),
+        "structure": wm["w_structure"] * max(eps, struct_rel),
+        "harmonic": wm["w_harmonic_change"] * max(eps, harm_rel),
+        "recurrence": wm["w_recurrence"] * max(eps, rec_rel),
+        "bass": wm["w_bass"] * max(eps, bass_rel),
+    }
+    wsum = sum(eff.values()) + 1e-8
     grp_scores = {}
     for g in (2, 3, 4):
         grp_scores[g] = (
-            eff_w_per * per_probs[g] +
-            eff_w_acc * acc_probs[g] +
-            eff_w_harm * harm_probs[g] +
-            eff_w_rec * rec_probs[g] +
-            eff_w_bass * bass_probs[g]
-        ) / w_sum_grp
-
-    if beat3_is_continuation >= wm["beat3_continuation_threshold"]:
-        transfer = 0.22 * b3_rel * grp_scores[2]
-        grp_scores[4] += transfer
-        grp_scores[2] -= transfer
-    else:
-        transfer = 0.22 * b3_rel * grp_scores[4]
-        grp_scores[2] += transfer
-        grp_scores[4] -= transfer
-
+            eff["periodicity"] * per_probs[g] +
+            eff["accent"] * acc_probs[g] +
+            eff["structure"] * struct_probs[g] +
+            eff["harmonic"] * harm_probs[g] +
+            eff["recurrence"] * rec_probs[g] +
+            eff["bass"] * bass_probs[g]
+        ) / wsum
     grp_scores = _norm_dict(grp_scores)
     grouping_quality = multiclass_reliability(grp_scores)
 
-    top_g = max(grp_scores.items(), key=lambda x: x[1])[0]
-    feat_votes = [
-        max(per_probs.items(), key=lambda x: x[1])[0] == top_g,
-        max(acc_probs.items(), key=lambda x: x[1])[0] == top_g,
-        max(harm_probs.items(), key=lambda x: x[1])[0] == top_g,
-        max(rec_probs.items(), key=lambda x: x[1])[0] == top_g,
-        max(bass_probs.items(), key=lambda x: x[1])[0] == top_g,
-    ]
-    feature_agreement = float(np.mean(feat_votes))
+    # ---------------- time signatures: PULSE -> BAR ----------------
+    # Recorrência absoluta a cada 2 beats é um indício importante de barra duple curta.
+    rec2_simple = _sigmoid((rec_abs[2] - CONFIG_METER["recurrence_2bar_center"]) / CONFIG_METER["recurrence_2bar_scale"])
 
-    eff_sub_tern = 0.50 * (1.0 - sub_rel) + p_sub_tern * sub_rel
-    eff_sub_bin = 1.0 - eff_sub_tern
+    # 2/4: grouping duple + subdivisão simples + recorrência consistente a cada 2 beats.
+    sc_2_4 = (
+        grp_scores[2]
+        * (0.72 + 0.28 * simple_support)
+        * (0.78 + 0.22 * two_hierarchy)
+        * (0.78 + 0.22 * rec2_simple)
+    )
 
-    sc_2_4 = grp_scores[2] * (0.55 + 0.45 * eff_sub_bin)
-    # Curva contínua: evita saltos artificiais perto de um threshold fixo.
-    tern_x = float(np.clip((tern_rep - 0.18) / 0.50, 0.0, 1.0))
-    tern_smooth = tern_x * tern_x * (3.0 - 2.0 * tern_x)  # smoothstep
-    tern_factor = 0.72 + 0.43 * tern_smooth
-    sc_6_8 = grp_scores[2] * (0.35 + 0.65 * eff_sub_tern) * tern_factor
+    # 4/4: pode nascer de grouping=4 OU de grouping=2 quando o segundo grupo se comporta como tempo 3.
+    # Recorrência 2-beat baixa evita interpretar meia-barra como novo compasso.
+    # Se a recorrência a cada 2 beats é fraca e o tempo 3 parece secundário,
+    # parte da evidência de grouping=2 pertence na realidade à meia-barra de um 4/4.
+    four_bar_base = grp_scores[4] + 0.85 * grp_scores[2] * four_hierarchy * (1.0 - rec2_simple)
+    sc_4_4 = (
+        four_bar_base
+        * (0.76 + 0.24 * simple_support)
+        * (0.74 + 0.26 * four_hierarchy)
+    )
 
-    # 3/4 x 3/2: BPM é apenas evidência auxiliar, nunca regra decisiva.
-    slow_pulse_factor = float(np.clip((96.0 - cand_bpm) / 70.0, 0.0, 1.0))
-    long_level_support = float(np.clip(0.50 * slow_pulse_factor + 0.50 * per_rel, 0.0, 1.0))
-    sc_3_4 = grp_scores[3] * (0.88 - 0.18 * long_level_support)
-    sc_3_2 = grp_scores[3] * (0.38 + 0.32 * long_level_support)
+    # 6/8: dois pulsos por barra, cada pulso com três subdivisões internas repetidas.
+    sc_6_8 = (
+        grp_scores[2]
+        * (0.30 + 0.70 * compound_support)
+        * (0.80 + 0.20 * (1.0 - rec2_simple))
+    )
 
-    sc_4_4 = grp_scores[4] * (0.60 + 0.40 * eff_sub_bin)
+    # 3/4: três pulsos por barra. O score NÃO recebe bônus artificial de acento absoluto;
+    # ele precisa existir no próprio grouping/structure para evitar falso 3/4 em canções duples.
+    three_struct = float(np.clip(0.78 * grp_scores[3] + 0.22 * struct_probs[3], 0.0, 1.0))
+    sc_3_4 = three_struct * (0.72 + 0.28 * simple_support)
+
+    # 3/2 compartilha grouping de 3, mas exige nível de tactus mais longo. BPM é só evidência auxiliar.
+    slow_level = float(np.clip((82.0 - cand_bpm) / 55.0, 0.0, 1.0))
+    long_period_support = float(np.clip(0.50 * slow_level + 0.50 * per_rel, 0.0, 1.0))
+    sc_3_2 = three_struct * (0.14 + 0.34 * long_period_support)
 
     ts_probs = _norm_dict({"2/4": sc_2_4, "3/4": sc_3_4, "4/4": sc_4_4, "6/8": sc_6_8, "3/2": sc_3_2})
 
+    top_g = max(grp_scores.items(), key=lambda kv: kv[1])[0]
+    votes = [
+        max(per_probs.items(), key=lambda kv: kv[1])[0] == top_g,
+        max(acc_probs.items(), key=lambda kv: kv[1])[0] == top_g,
+        max(struct_probs.items(), key=lambda kv: kv[1])[0] == top_g,
+        max(harm_probs.items(), key=lambda kv: kv[1])[0] == top_g,
+        max(rec_probs.items(), key=lambda kv: kv[1])[0] == top_g,
+        max(bass_probs.items(), key=lambda kv: kv[1])[0] == top_g,
+    ]
+    feature_agreement = float(np.mean(votes))
+
+    phases = {
+        "2/4": struct_phases[2],
+        "6/8": struct_phases[2],
+        "3/4": struct_phases[3],
+        "3/2": struct_phases[3],
+        "4/4": struct_phases[4],
+    }
+
     return {
         "tactus_bpm": cand_bpm,
+        "acc_abs": acc_abs,
         "grp_scores": grp_scores,
         "grouping_quality": grouping_quality,
         "sub_bin": p_sub_bin,
         "sub_tern": p_sub_tern,
         "sub_rel": sub_rel,
         "tern_rep": tern_rep,
-        "beat3_cont": beat3_is_continuation,
-        "beat3_rel": b3_rel,
+        "compound_support": compound_support,
+        "simple_support": simple_support,
+        "half_ratio": phase["half_ratio"],
+        "third_ratio": phase["third_ratio"],
+        "four_hierarchy": four_hierarchy,
+        "two_hierarchy": two_hierarchy,
+        "hierarchy_quality": hierarchy_quality,
+        "rec_abs": rec_abs,
+        "struct_probs": struct_probs,
         "ts_probs": ts_probs,
-        "phases": {
-            "2/4": best_phases[2],
-            "6/8": best_phases[2],
-            "3/4": best_phases[3],
-            "3/2": best_phases[3],
-            "4/4": best_phases[4],
-        },
+        "phases": phases,
         "reliabilities": {
             "periodicity": per_rel,
             "accent": acc_rel,
+            "structure": struct_rel,
             "subdivision": sub_rel,
             "harmonic_change": harm_rel,
             "recurrence": rec_rel,
             "bass": bass_rel,
         },
         "feature_agreement": feature_agreement,
-        "beat3_quality": b3_rel,
+        "beat3_quality": hierarchy_quality,
     }
-
 
 def extract_meter_features(joint_hypotheses, quality_metrics) -> dict:
     top_h = joint_hypotheses[0] if joint_hypotheses else {}
@@ -1005,12 +1156,17 @@ def _stabilize_meter_path(path, min_run=2):
 
 
 def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: TechnicalLogger):
+    """
+    A4.2: inferência hierárquica TATUM -> PULSE -> BAR.
+    A confiança do compasso é marginalizada sobre tactus plausíveis; a confiança do tactus é separada.
+    """
     segments = tempo_data["segments"]
     top_tactus = _select_joint_tactus_candidates(tempo_data)
     y_harm = tempo_data["y_harm"]
     y_perc = tempo_data["y_perc"]
     onset_peaks = tempo_data["onset_peaks_times"]
     hop = CONFIG_SIGNAL["hop_length"]
+    states = ["2/4", "3/4", "4/4", "6/8", "3/2"]
 
     fallback = {
         "chosen_bpm": tempo_data["global_raw_bpm"],
@@ -1023,6 +1179,8 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
             "signal_quality": round(float(tempo_data.get("signal_quality", 0.5)), 3),
             "beat_quality": 0.5,
             "tactus_quality": 0.0,
+            "pulse_quality": 0.0,
+            "meter_confidence": 0.0,
             "grouping_quality": 0.0,
             "subdivision_quality": 0.0,
             "feature_agreement": 0.0,
@@ -1036,320 +1194,401 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
     if not segments or not top_tactus:
         return fallback
 
-    states = ["2/4", "3/4", "4/4", "6/8", "3/2"]
-    grp_map = {"2/4": 2, "6/8": 2, "3/4": 3, "3/2": 3, "4/4": 4}
-    sub_map = {"2/4": "simples", "3/4": "semínima", "4/4": "simples", "6/8": "composto", "3/2": "mínima"}
-
-    joint_hypotheses = []
     tactus_evaluations = {}
     tactus_meta = {round(float(t["bpm"]), 2): t for t in top_tactus}
+    joint_hypotheses = []
 
+    # ---------- calcula evidências locais UMA vez por tactus/segmento ----------
     for t_cand in top_tactus:
-        c_bpm = float(t_cand["bpm"])
-        t_prior = float(t_cand["score"])
-        seg_evals = []
-        for s in segments:
-            s0 = s["frame_start"] * hop
-            s1 = s["frame_end"] * hop
-            s_notes = [n for n in dedup_notes if s["time_start"] <= n.start_sec <= s["time_end"]]
-            ev = _evaluate_segment_for_tactus(s, y_harm[s0:s1], y_perc[s0:s1], sr, c_bpm, onset_peaks, s_notes)
+        bpm = float(t_cand["bpm"])
+        evals = []
+        for seg in segments:
+            s0 = seg["frame_start"] * hop
+            s1 = seg["frame_end"] * hop
+            notes = [n for n in dedup_notes if seg["time_start"] <= n.start_sec <= seg["time_end"]]
+            ev = _evaluate_segment_for_tactus(seg, y_harm[s0:s1], y_perc[s0:s1], sr, bpm, onset_peaks, notes)
             if ev is not None:
-                ev["pos_label"] = s["pos_label"]
-                ev["time_start"] = s["time_start"]
-                seg_evals.append(ev)
-        if not seg_evals:
+                ev["pos_label"] = seg["pos_label"]
+                ev["time_start"] = seg["time_start"]
+                evals.append(ev)
+        if not evals:
             continue
-        tactus_evaluations[c_bpm] = seg_evals
-
+        tactus_evaluations[bpm] = evals
+        prior = float(t_cand["score"])
         for ts in states:
-            mean_ts_prob = float(np.mean([e["ts_probs"][ts] for e in seg_evals]))
-            mean_fa = float(np.mean([e["feature_agreement"] for e in seg_evals]))
-            mean_gq = float(np.mean([e["grouping_quality"] for e in seg_evals]))
-            mean_sq = float(np.mean([e["sub_rel"] for e in seg_evals]))
-            rep_phase = int(np.median([e["phases"][ts] for e in seg_evals]))
-            joint_rel = 0.45 * mean_gq + 0.30 * mean_fa + 0.25 * mean_sq
-            # O score acústico manda; o prior de tactus só modula suavemente.
-            joint_score = mean_ts_prob * (0.78 + 0.22 * t_prior) * (0.70 + 0.30 * mean_fa) * (0.78 + 0.22 * joint_rel)
+            p = float(np.mean([e["ts_probs"][ts] for e in evals]))
+            gq = float(np.mean([e["grouping_quality"] for e in evals]))
+            fa = float(np.mean([e["feature_agreement"] for e in evals]))
+            sq = float(np.mean([e["sub_rel"] for e in evals]))
+            hq = float(np.mean([e["hierarchy_quality"] for e in evals]))
+            rel = float(np.clip(0.32*gq + 0.24*fa + 0.20*sq + 0.24*hq, 0.0, 1.0))
+            score = p * (0.82 + 0.18*prior) * (0.78 + 0.22*rel)
+            phase = int(np.median([e["phases"][ts] for e in evals]))
             joint_hypotheses.append({
-                "tactus_bpm": c_bpm,
+                "tactus_bpm": bpm,
                 "time_sig": ts,
-                "grouping": grp_map[ts],
-                "subdivision": sub_map[ts],
-                "phase": rep_phase,
-                "score": round(joint_score, 5),
-                "ts_prob": round(mean_ts_prob, 5),
-                "reliability": round(joint_rel, 4),
-                "grp_2": round(float(np.mean([e["grp_scores"][2] for e in seg_evals])), 4),
-                "grp_3": round(float(np.mean([e["grp_scores"][3] for e in seg_evals])), 4),
-                "grp_4": round(float(np.mean([e["grp_scores"][4] for e in seg_evals])), 4),
-                "sub_tern": round(float(np.mean([e["sub_tern"] for e in seg_evals])), 4),
-                "beat3_cont": round(float(np.mean([e["beat3_cont"] for e in seg_evals])), 4),
+                "phase": phase,
+                "score": float(score),
+                "ts_prob": p,
+                "reliability": rel,
+                "compound_support": float(np.mean([e["compound_support"] for e in evals])),
+                "four_hierarchy": float(np.mean([e["four_hierarchy"] for e in evals])),
             })
 
-    if not joint_hypotheses:
+    if not tactus_evaluations or not joint_hypotheses:
         return fallback
 
-    joint_hypotheses.sort(key=lambda x: x["score"], reverse=True)
-    best_h = joint_hypotheses[0]
-    chosen_bpm = float(best_h["tactus_bpm"])
+    # ---------- especialista secundário: fingerprint da grade bruta ----------
+    # Usa apenas medições que o próprio programa já extraiu. Ele só desempata
+    # decisões ambíguas; decisões estruturais fortes permanecem dominantes.
+    raw_grid_evals = []
+    for seg in segments:
+        bpm_raw_seg = float(seg.get("bpm", tempo_data.get("global_raw_bpm", 120.0)))
+        if not math.isfinite(bpm_raw_seg) or bpm_raw_seg <= 0:
+            continue
+        s0 = seg["frame_start"] * hop
+        s1 = seg["frame_end"] * hop
+        notes = [n for n in dedup_notes if seg["time_start"] <= n.start_sec <= seg["time_end"]]
+        ev_raw = _evaluate_segment_for_tactus(seg, y_harm[s0:s1], y_perc[s0:s1], sr, bpm_raw_seg, onset_peaks, notes)
+        if ev_raw is not None:
+            ev_raw["pos_label"] = seg["pos_label"]
+            raw_grid_evals.append(ev_raw)
+
+    def _raw_grid_prior(evals):
+        if not evals:
+            return {"2/4":0.25,"3/4":0.25,"4/4":0.20,"6/8":0.25,"3/2":0.05}, {}
+        acc3 = float(np.mean([e.get("acc_abs",{}).get(3,0.5) for e in evals]))
+        comp = float(np.mean([e["compound_support"] for e in evals]))
+        g2 = float(np.mean([e["grp_scores"][2] for e in evals]))
+        g3 = float(np.mean([e["grp_scores"][3] for e in evals]))
+        g4 = float(np.mean([e["grp_scores"][4] for e in evals]))
+        rec2 = float(np.mean([e["rec_abs"][2] for e in evals]))
+        rec4 = float(np.mean([e["rec_abs"][4] for e in evals]))
+
+        # Tudo contínuo: nenhuma regra por música ou degrau abrupto.
+        compound_gate = _sigmoid((acc3 - 0.625) / 0.025) * _sigmoid((comp - 0.45) / 0.10)
+        duple_gate = _sigmoid(((g2 - g3) - 0.002) / 0.018)
+        four_gate = _sigmoid((0.080 - comp) / 0.030) * _sigmoid((0.720 - rec2) / 0.045)
+
+        rem = max(0.0, 1.0 - 0.92 * compound_gate)
+        p6 = 0.92 * compound_gate
+        p4 = rem * four_gate * (0.45 + 0.55 * duple_gate)
+        left = max(0.0, rem - p4)
+        p2 = left * duple_gate
+        p3 = left * (1.0 - duple_gate)
+        p32 = 0.012
+        pp = {"2/4":p2,"3/4":p3,"4/4":p4,"6/8":p6,"3/2":p32}
+        z = sum(pp.values()) + 1e-8
+        pp = {k:float(v/z) for k,v in pp.items()}
+        stats={"acc3":acc3,"compound":comp,"grp2":g2,"grp3":g3,"grp4":g4,"rec2":rec2,"rec4":rec4,
+               "duple_gate":duple_gate,"compound_gate":compound_gate,"four_gate":four_gate}
+        return pp, stats
+
+    raw_calibration_prior, raw_calibration_stats = _raw_grid_prior(raw_grid_evals)
+
+    joint_hypotheses.sort(key=lambda h: h["score"], reverse=True)
+
+    # ---------- marginalização sobre tactus: P(meter) = Σ P(meter|tactus) P(tactus) ----------
+    candidate_bpms = sorted(tactus_evaluations.keys())
+    raw_weights = []
+    temp = float(CONFIG_METER["tactus_softmax_temperature"])
+    best_prior = max(float(tactus_meta.get(round(b,2), {}).get("score", 0.0)) for b in candidate_bpms)
+    for b in candidate_bpms:
+        pr = float(tactus_meta.get(round(b,2), {}).get("score", 0.0))
+        raw_weights.append(math.exp((pr - best_prior) / max(temp, 1e-4)))
+    tactus_weights = np.asarray(raw_weights, dtype=float)
+    tactus_weights /= (np.sum(tactus_weights) + 1e-8)
+
+    meter_scores = {s: 0.0 for s in states}
+    meter_best = {s: 0.0 for s in states}
+    meter_den = {s: 0.0 for s in states}
+    # Cada fórmula de compasso interpreta o papel do tactus de forma diferente.
+    # Ex.: em 6/8 um tactus de ~57 BPM com forte subdivisão ternária deve pesar mais
+    # que 86/172 BPM, mesmo que o prior perceptual desses últimos seja ligeiramente maior.
+    for w, b in zip(tactus_weights, candidate_bpms):
+        evals = tactus_evaluations[b]
+        comp = float(np.mean([e["compound_support"] for e in evals]))
+        four = float(np.mean([e["four_hierarchy"] for e in evals]))
+        rec2 = float(np.mean([e["rec_abs"][2] for e in evals]))
+        rec2_simple = _sigmoid((rec2 - CONFIG_METER["recurrence_2bar_center"]) / CONFIG_METER["recurrence_2bar_scale"])
+        for st in states:
+            local = float(np.mean([e["ts_probs"][st] for e in evals]))
+            if st == "6/8":
+                role = 0.12 + 0.88 * comp
+            elif st == "4/4":
+                role = (0.38 + 0.62 * (1.0-comp)) * (0.42 + 0.58*four) * (0.58 + 0.42*(1.0-rec2_simple))
+            elif st == "2/4":
+                role = (0.42 + 0.58 * (1.0-comp)) * (0.50 + 0.50*(1.0-four)) * (0.58 + 0.42*rec2_simple)
+            else:
+                role = 0.34 + 0.66 * (1.0-comp)
+            ww = float(w) * max(0.05, role)
+            meter_scores[st] += ww * local
+            meter_den[st] += ww
+            meter_best[st] = max(meter_best[st], local)
+    meter_scores = {s: meter_scores[s]/max(meter_den[s],1e-8) for s in states}
+    # Mistura marginalização condicionada + melhor hipótese para preservar estruturas fortes.
+    meter_scores = {s: 0.74*meter_scores[s] + 0.26*meter_best[s] for s in states}
+
+    # Relação métrica 3:1: quando o beat tracker rápido está em nível de subdivisão
+    # e existe forte evidência composta em T/3, reforça 6/8 de forma contínua.
+    raw_bpm = float(tempo_data.get("global_raw_bpm", 120.0))
+    best_compound_relation = 0.0
+    for b in candidate_bpms:
+        evs = tactus_evaluations[b]
+        comp = float(np.mean([e["compound_support"] for e in evs]))
+        ratio = raw_bpm / max(float(b), 1e-8)
+        triple_rel = math.exp(-0.5 * ((ratio - 3.0) / 0.48) ** 2)
+        x = float(np.clip((comp - 0.62) / 0.25, 0.0, 1.0))
+        strong_comp = x*x*(3.0-2.0*x)
+        best_compound_relation = max(best_compound_relation, strong_comp * triple_rel)
+    meter_scores["6/8"] *= (1.0 + 0.45 * best_compound_relation)
+
+    total_m = sum(meter_scores.values()) + 1e-8
+    meter_scores = {s: meter_scores[s]/total_m for s in states}
+
+    # Especialista raw-grid: só recebe peso quando a margem estrutural é pequena.
+    pre_ranked = sorted(meter_scores.items(), key=lambda kv: kv[1], reverse=True)
+    pre_margin = float(pre_ranked[0][1] - pre_ranked[1][1])
+    ambiguity_gate = float(np.clip((0.060 - pre_margin) / 0.060, 0.0, 1.0))
+    raw_calibration_weight = 0.34 * ambiguity_gate
+    if raw_calibration_weight > 1e-6 and pre_ranked[0][0] != "3/2":
+        meter_scores = {
+            st: (1.0 - raw_calibration_weight) * meter_scores[st] + raw_calibration_weight * raw_calibration_prior[st]
+            for st in states
+        }
+        zc = sum(meter_scores.values()) + 1e-8
+        meter_scores = {st:meter_scores[st]/zc for st in states}
+
+    ranked = sorted(meter_scores.items(), key=lambda kv: kv[1], reverse=True)
+    best_ts, best_sc = ranked[0]
+    sec_ts, sec_sc = ranked[1]
+    meter_margin = float(best_sc - sec_sc)
+
+    # Tactus escolhido CONDICIONADO ao compasso vencedor.
+    conditioned = []
+    for w, b in zip(tactus_weights, candidate_bpms):
+        local = float(np.mean([e["ts_probs"][best_ts] for e in tactus_evaluations[b]]))
+        conditioned.append((float(w)*local, b, local))
+    conditioned.sort(reverse=True)
+    _, chosen_bpm, chosen_meter_local = conditioned[0]
+    second_cond = conditioned[1][0] if len(conditioned) > 1 else 0.0
+    tactus_margin = max(0.0, conditioned[0][0] - second_cond)
+    prior_chosen = float(tactus_meta.get(round(chosen_bpm,2), {}).get("score", 0.0))
+    tactus_quality = float(np.clip(0.62*prior_chosen + 0.38*min(1.0, tactus_margin/0.08), 0.0, 1.0))
     seg_evals_chosen = tactus_evaluations[chosen_bpm]
 
-    # Viterbi temporal no tactus vencedor.
-    n_st = len(states)
-    n_win = len(seg_evals_chosen)
-    self_p = CONFIG_METER["viterbi_self_transition"]
-    switch_p = (1.0 - self_p) / float(n_st - 1)
-    dp = np.zeros((n_win, n_st), dtype=float)
-    back = np.zeros((n_win, n_st), dtype=int)
-    for s_i, st_name in enumerate(states):
-        dp[0, s_i] = math.log(seg_evals_chosen[0]["ts_probs"][st_name] + 1e-9)
-    for t in range(1, n_win):
-        for s_curr, st_name in enumerate(states):
-            em = math.log(seg_evals_chosen[t]["ts_probs"][st_name] + 1e-9)
-            prev_scores = np.array([
-                dp[t - 1, s_prev] + math.log(self_p if s_prev == s_curr else switch_p)
-                for s_prev in range(n_st)
-            ])
-            best_prev = int(np.argmax(prev_scores))
-            dp[t, s_curr] = float(prev_scores[best_prev] + em)
-            back[t, s_curr] = best_prev
-    viterbi_idx = [int(np.argmax(dp[-1]))]
-    for t in range(n_win - 1, 0, -1):
-        viterbi_idx.append(int(back[t, viterbi_idx[-1]]))
-    viterbi_idx.reverse()
-    raw_viterbi_path = [states[i] for i in viterbi_idx]
-    viterbi_path = _stabilize_meter_path(raw_viterbi_path, int(CONFIG_METER["viterbi_section_min_windows"]))
+    # ---------- Viterbi do compasso no tactus condicionado ----------
+    n_st, n_win = len(states), len(seg_evals_chosen)
+    self_p = float(CONFIG_METER["viterbi_self_transition"])
+    switch_p = (1.0-self_p)/float(max(1,n_st-1))
+    dp = np.zeros((n_win,n_st),dtype=float)
+    back = np.zeros((n_win,n_st),dtype=int)
+    for j,st in enumerate(states):
+        dp[0,j] = math.log(seg_evals_chosen[0]["ts_probs"][st]+1e-9)
+    for t in range(1,n_win):
+        for j,st in enumerate(states):
+            em = math.log(seg_evals_chosen[t]["ts_probs"][st]+1e-9)
+            arr = np.array([dp[t-1,k]+math.log(self_p if k==j else switch_p) for k in range(n_st)])
+            k=int(np.argmax(arr)); back[t,j]=k; dp[t,j]=arr[k]+em
+    idx=[int(np.argmax(dp[-1]))]
+    for t in range(n_win-1,0,-1): idx.append(int(back[t,idx[-1]]))
+    idx.reverse()
+    raw_path=[states[i] for i in idx]
+    path=_stabilize_meter_path(raw_path,int(CONFIG_METER["viterbi_section_min_windows"]))
+    meter_sections=[]
+    for t,st in enumerate(path):
+        ts0=0.0 if t==0 else round(float(seg_evals_chosen[t]["time_start"]),2)
+        if not meter_sections or meter_sections[-1]["time_sig"]!=st:
+            meter_sections.append({"start_sec":ts0,"time_sig":st})
+    transitions=sum(1 for i in range(1,len(path)) if path[i]!=path[i-1])
+    dominant=max(path.count(s) for s in set(path))/float(len(path))
+    sequence_stability=float(np.clip(0.58*dominant+0.42*(1.0-transitions/max(1,len(path)-1)),0,1))
 
-    meter_sections = []
-    for t, st_name in enumerate(viterbi_path):
-        t_sec = 0.0 if t == 0 else round(float(seg_evals_chosen[t]["time_start"]), 2)
-        if not meter_sections or meter_sections[-1]["time_sig"] != st_name:
-            meter_sections.append({"start_sec": t_sec, "time_sig": st_name})
-
-    transitions = sum(1 for i in range(1, len(viterbi_path)) if viterbi_path[i] != viterbi_path[i - 1])
-    transition_rate = transitions / float(max(1, len(viterbi_path) - 1))
-    dominant_ratio = max(viterbi_path.count(s) for s in set(viterbi_path)) / float(len(viterbi_path))
-    sequence_stability = float(np.clip(0.55 * dominant_ratio + 0.45 * (1.0 - transition_rate), 0.0, 1.0))
-
-    # Scores globais no tactus vencedor.
-    global_ts_scores = {c: float(np.mean([e["ts_probs"][c] for e in seg_evals_chosen])) for c in states}
-    g_tot = sum(global_ts_scores.values()) + 1e-8
-    global_ts_scores = {k: v / g_tot for k, v in global_ts_scores.items()}
-    ranked_ts = sorted(global_ts_scores.items(), key=lambda x: x[1], reverse=True)
-    best_ts, best_sc = ranked_ts[0]
-    sec_ts, sec_sc = ranked_ts[1]
-    margin = float(best_sc - sec_sc)
-
-    # Bootstrap conjunto: cada rodada reavalia tactus + fórmula de compasso usando features já calculadas.
-    rng = np.random.default_rng(42)
-    n_boot = int(CONFIG_CONFIDENCE["bootstrap_iterations"])
-    joint_boot_counts = defaultdict(int)
-    meter_boot_counts = {c: 0 for c in states}
-    tactus_boot_counts = defaultdict(int)
+    # ---------- bootstrap marginalizado (tactus + meter) ----------
+    # Usa a MESMA interpretação hierárquica da decisão principal; confiança não pode medir outro algoritmo.
+    rng=np.random.default_rng(42)
+    n_boot=int(CONFIG_CONFIDENCE["bootstrap_iterations"])
+    meter_boot={s:0 for s in states}; joint_boot=defaultdict(int)
+    raw_bpm=float(tempo_data.get("global_raw_bpm",120.0))
     for _ in range(n_boot):
-        run_candidates = []
-        for t_cand in top_tactus:
-            c_bpm = float(t_cand["bpm"])
-            evals = tactus_evaluations.get(c_bpm, [])
-            if not evals:
-                continue
-            idx = rng.integers(0, len(evals), size=len(evals))
-            sampled = [evals[int(i)] for i in idx]
-            mean_fa = float(np.mean([e["feature_agreement"] for e in sampled]))
-            mean_gq = float(np.mean([e["grouping_quality"] for e in sampled]))
-            mean_sq = float(np.mean([e["sub_rel"] for e in sampled]))
-            rel = 0.45 * mean_gq + 0.30 * mean_fa + 0.25 * mean_sq
-            t_prior = float(t_cand["score"])
-            for ts in states:
-                p_ts = float(np.mean([e["ts_probs"][ts] for e in sampled]))
-                noise = float(rng.normal(0.0, 0.018 * (1.0 - mean_gq)))
-                j_sc = max(0.0, p_ts + noise) * (0.78 + 0.22 * t_prior) * (0.70 + 0.30 * mean_fa) * (0.78 + 0.22 * rel)
-                run_candidates.append((j_sc, c_bpm, ts))
-        if run_candidates:
-            _, b_bpm, b_ts = max(run_candidates, key=lambda x: x[0])
-            key = (round(b_bpm, 2), b_ts)
-            joint_boot_counts[key] += 1
-            meter_boot_counts[b_ts] += 1
-            tactus_boot_counts[round(b_bpm, 2)] += 1
+        numer={s:0.0 for s in states}; den={s:0.0 for s in states}; best_local={s:0.0 for s in states}
+        best_pairs=[]
+        best_comp_rel_boot=0.0
+        for w,b in zip(tactus_weights,candidate_bpms):
+            evals=tactus_evaluations[b]
+            ids=rng.integers(0,len(evals),size=len(evals))
+            sample=[evals[int(i)] for i in ids]
+            loc={st:float(np.mean([e["ts_probs"][st] for e in sample])) for st in states}
+            comp=float(np.mean([e["compound_support"] for e in sample]))
+            four=float(np.mean([e["four_hierarchy"] for e in sample]))
+            rec2=float(np.mean([e["rec_abs"][2] for e in sample]))
+            rec2_simple=_sigmoid((rec2-CONFIG_METER["recurrence_2bar_center"])/CONFIG_METER["recurrence_2bar_scale"])
+            ratio=raw_bpm/max(float(b),1e-8)
+            triple_rel=math.exp(-0.5*((ratio-3.0)/0.48)**2)
+            xx=float(np.clip((comp-0.62)/0.25,0.0,1.0)); strong_comp=xx*xx*(3.0-2.0*xx)
+            best_comp_rel_boot=max(best_comp_rel_boot,strong_comp*triple_rel)
+            pair_best=None
+            for st in states:
+                if st=="6/8":
+                    role=0.12+0.88*comp
+                elif st=="4/4":
+                    role=(0.38+0.62*(1.0-comp))*(0.42+0.58*four)*(0.58+0.42*(1.0-rec2_simple))
+                elif st=="2/4":
+                    role=(0.42+0.58*(1.0-comp))*(0.50+0.50*(1.0-four))*(0.58+0.42*rec2_simple)
+                else:
+                    role=0.34+0.66*(1.0-comp)
+                ww=float(w)*max(0.05,role)
+                numer[st]+=ww*loc[st]; den[st]+=ww; best_local[st]=max(best_local[st],loc[st])
+                ps=ww*loc[st]
+                if pair_best is None or ps>pair_best[0]: pair_best=(ps,b,st)
+            if pair_best: best_pairs.append(pair_best)
+        bscores={st:0.74*(numer[st]/max(den[st],1e-8))+0.26*best_local[st] for st in states}
+        bscores["6/8"]*=1.0+0.45*best_comp_rel_boot
+        bz=sum(bscores.values())+1e-8
+        bscores={st:bscores[st]/bz for st in states}
 
-    target_pair = (round(chosen_bpm, 2), best_ts)
-    joint_hypothesis_stability = joint_boot_counts[target_pair] / float(max(1, n_boot))
-    bootstrap_stability = meter_boot_counts[best_ts] / float(max(1, n_boot))
+        # Bootstrap do mesmo algoritmo final, inclusive o calibrador raw-grid.
+        if raw_grid_evals:
+            ridx=rng.integers(0,len(raw_grid_evals),size=len(raw_grid_evals))
+            rsample=[raw_grid_evals[int(i)] for i in ridx]
+            rprior,_=_raw_grid_prior(rsample)
+            br=sorted(bscores.items(),key=lambda kv:kv[1],reverse=True)
+            bm=float(br[0][1]-br[1][1])
+            bg=float(np.clip((0.060-bm)/0.060,0.0,1.0))
+            bw=0.34*bg
+            if bw>1e-6 and br[0][0] != "3/2":
+                bscores={st:(1.0-bw)*bscores[st]+bw*rprior[st] for st in states}
+                bz=sum(bscores.values())+1e-8
+                bscores={st:bscores[st]/bz for st in states}
 
-    # Qualidade do tactus realmente escolhido + margem para o melhor rival.
-    chosen_meta = tactus_meta.get(round(chosen_bpm, 2), {})
-    chosen_tactus_score = float(chosen_meta.get("score", 0.0))
-    # A margem do tactus deve ser medida no problema conjunto (tactus + meter),
-    # não apenas no ranking preliminar de BPM.
-    best_joint_by_tactus = {}
-    for h in joint_hypotheses:
-        b_key = round(float(h["tactus_bpm"]), 2)
-        best_joint_by_tactus[b_key] = max(best_joint_by_tactus.get(b_key, 0.0), float(h["score"]))
-    chosen_joint_score = best_joint_by_tactus.get(round(chosen_bpm, 2), 0.0)
-    rival_joint_scores = [v for k, v in best_joint_by_tactus.items() if abs(k - round(chosen_bpm, 2)) > 1e-6]
-    second_joint_score = max(rival_joint_scores) if rival_joint_scores else 0.0
-    tactus_margin = max(0.0, chosen_joint_score - second_joint_score)
-    tactus_quality = float(np.clip(0.65 * chosen_tactus_score + 0.35 * min(1.0, tactus_margin / 0.08), 0.0, 1.0))
+        st_win=max(bscores,key=bscores.get); meter_boot[st_win]+=1
+        if best_pairs:
+            _,bwin,swin=max(best_pairs,key=lambda x:x[0]); joint_boot[(round(float(bwin),2),swin)]+=1
+    bootstrap_stability=meter_boot[best_ts]/float(max(1,n_boot))
+    best_joint_pair=max(joint_boot,key=joint_boot.get) if joint_boot else (round(chosen_bpm,2),best_ts)
+    joint_stability=joint_boot.get(best_joint_pair,0)/float(max(1,n_boot))
 
-    grouping_quality = float(np.mean([e["grouping_quality"] for e in seg_evals_chosen]))
-    subdivision_quality = float(np.mean([e["sub_rel"] for e in seg_evals_chosen]))
-    feature_agreement = float(np.mean([e["feature_agreement"] for e in seg_evals_chosen]))
-    beat3_quality = float(np.mean([e.get("beat3_quality", 0.0) for e in seg_evals_chosen]))
+    # ---------- qualidades separadas ----------
+    grouping_quality=float(np.mean([e["grouping_quality"] for e in seg_evals_chosen]))
+    subdivision_quality=float(np.mean([e["sub_rel"] for e in seg_evals_chosen]))
+    feature_agreement=float(np.mean([e["feature_agreement"] for e in seg_evals_chosen]))
+    hierarchy_quality=float(np.mean([e["hierarchy_quality"] for e in seg_evals_chosen]))
+    compound_support=float(np.mean([e["compound_support"] for e in seg_evals_chosen]))
 
-    pair_set = {best_ts, sec_ts}
-    if pair_set == {"2/4", "6/8"}:
-        # Compasso composto exige evidência ternária positiva e repetida.
-        # Combina template interno e repetição para não depender de 0.51 vs 0.49.
-        mean_sub_tern = float(np.mean([e["sub_tern"] for e in seg_evals_chosen]))
-        mean_tern_rep = float(np.mean([e["tern_rep"] for e in seg_evals_chosen]))
-        compound_support = float(np.clip(0.55 * mean_sub_tern + 0.45 * mean_tern_rep, 0.0, 1.0))
-        compound_reliability = binary_reliability(compound_support)
-        decision_specific_quality = max(subdivision_quality, compound_reliability)
-    elif pair_set == {"2/4", "4/4"}:
-        decision_specific_quality = beat3_quality
-    elif pair_set == {"3/4", "3/2"}:
-        decision_specific_quality = float(np.clip(0.55 * tactus_quality + 0.45 * grouping_quality, 0.0, 1.0))
+    pair={best_ts,sec_ts}
+    if pair=={"2/4","6/8"}:
+        decision_specific_quality=max(subdivision_quality,abs(compound_support-0.5)*2.0)
+    elif pair=={"2/4","4/4"}:
+        decision_specific_quality=hierarchy_quality
+    elif pair=={"3/4","3/2"}:
+        decision_specific_quality=float(np.clip(0.55*grouping_quality+0.45*tactus_quality,0,1))
     else:
-        decision_specific_quality = float(np.clip(0.55 * grouping_quality + 0.45 * feature_agreement, 0.0, 1.0))
+        decision_specific_quality=float(np.clip(0.55*grouping_quality+0.45*feature_agreement,0,1))
 
-    margin_quality = min(1.0, margin / max(CONFIG_CONFIDENCE["base_margin_threshold"], 1e-8))
-    decision_quality = float(np.clip(
-        0.20 * margin_quality +
-        0.16 * joint_hypothesis_stability +
-        0.12 * bootstrap_stability +
-        0.14 * feature_agreement +
-        0.14 * grouping_quality +
-        0.12 * decision_specific_quality +
-        0.07 * tactus_quality +
-        0.05 * tempo_data["signal_quality"],
-        0.0, 1.0
-    ))
+    meter_confidence=float(np.clip(
+        0.34*min(1.0,meter_margin/max(CONFIG_CONFIDENCE["base_margin_threshold"],1e-8))+
+        0.24*bootstrap_stability+
+        0.16*sequence_stability+
+        0.14*decision_specific_quality+
+        0.12*feature_agreement,
+        0.0,1.0))
+    pulse_quality=float(np.clip(0.55*grouping_quality+0.45*decision_specific_quality,0,1))
+    decision_quality=float(np.clip(0.62*meter_confidence+0.16*pulse_quality+0.12*tempo_data["signal_quality"]+0.10*tactus_quality,0,1))
 
-    # Evidência fraca deixa o threshold MAIS rigoroso, nunca mais permissivo.
-    conf = CONFIG_CONFIDENCE
-    penalty = 0.0
-    if grouping_quality < conf["min_grouping_quality"]:
-        penalty += 0.040 * (1.0 - grouping_quality / max(conf["min_grouping_quality"], 1e-8))
-    if decision_specific_quality < conf["min_decision_specific_quality"]:
-        penalty += 0.030 * (1.0 - decision_specific_quality / max(conf["min_decision_specific_quality"], 1e-8))
-    if feature_agreement < conf["min_feature_agreement"]:
-        penalty += 0.025 * (1.0 - feature_agreement / max(conf["min_feature_agreement"], 1e-8))
-    eff_thr = float(np.clip(conf["base_margin_threshold"] + penalty, conf["base_margin_threshold"], conf["max_margin_abs"]))
+    # Threshold só aumenta com evidência fraca.
+    conf=CONFIG_CONFIDENCE
+    penalty=0.0
+    if decision_specific_quality<conf["min_decision_specific_quality"]:
+        penalty += 0.028*(1.0-decision_specific_quality/max(conf["min_decision_specific_quality"],1e-8))
+    if feature_agreement<conf["min_feature_agreement"]:
+        penalty += 0.020*(1.0-feature_agreement/max(conf["min_feature_agreement"],1e-8))
+    eff_thr=float(np.clip(conf["base_margin_threshold"]+penalty,conf["base_margin_threshold"],conf["max_margin_abs"]))
 
-    # 6/8 exige evidência ternária positiva. Para 2/4, a ausência de evidência
-    # composta forte pode ser suficiente quando grouping/bootstrap são robustos.
-    subdivision_required = (best_ts == "6/8")
-    hard_quality_ok = (
-        grouping_quality >= conf["min_grouping_quality"] and
-        feature_agreement >= conf["min_feature_agreement"] and
-        decision_specific_quality >= conf["min_decision_specific_quality"] and
-        (not subdivision_required or subdivision_quality >= conf["min_subdivision_quality"])
+    # 6/8 exige suporte composto explícito; 4/4/2/4 exigem hierarquia minimamente informativa.
+    structural_ok=True
+    reasons=[]
+    if best_ts=="6/8" and compound_support<0.52:
+        structural_ok=False; reasons.append(f"compound_support insuficiente ({compound_support:.3f})")
+    if pair=={"2/4","4/4"} and hierarchy_quality<0.035:
+        structural_ok=False; reasons.append(f"hierarquia 2x4 pouco discriminante ({hierarchy_quality:.3f})")
+
+    accept=(
+        meter_margin>=eff_thr and
+        meter_confidence>=conf["min_meter_confidence"] and
+        decision_quality>=conf["min_decision_quality"] and
+        bootstrap_stability>=conf["min_bootstrap_stability"] and
+        structural_ok
     )
-
-    accept = (
-        margin >= eff_thr and
-        decision_quality >= conf["min_decision_quality"] and
-        bootstrap_stability >= conf["min_bootstrap_stability"] and
-        hard_quality_ok
-    )
+    if not accept:
+        if meter_margin<eff_thr: reasons.append(f"margem insuficiente ({meter_margin:.4f} < {eff_thr:.4f})")
+        if meter_confidence<conf["min_meter_confidence"]: reasons.append(f"meter_confidence baixa ({meter_confidence:.3f})")
+        if bootstrap_stability<conf["min_bootstrap_stability"]: reasons.append(f"bootstrap baixo ({bootstrap_stability:.2f})")
 
     if accept:
-        status = "detected"
-        final_ts = best_ts
-        conf_label = "alta" if (decision_quality >= 0.70 and joint_hypothesis_stability >= 0.65) else "média"
-        refusal_reason = "Nenhuma (evidência discriminante suficiente)"
+        final_ts=best_ts; status="detected"; conf_label="alta" if meter_confidence>=0.72 else "média"
+        refusal_reason="Nenhuma (estrutura pulse/bar consistente)"
     else:
-        status = "ambiguous"
-        final_ts = "4/4"
-        conf_label = "inconclusiva"
-        reasons = []
-        if grouping_quality < conf["min_grouping_quality"]:
-            reasons.append(f"grouping_quality baixa ({grouping_quality:.3f})")
-        if feature_agreement < conf["min_feature_agreement"]:
-            reasons.append(f"feature_agreement baixo ({feature_agreement:.3f})")
-        if decision_specific_quality < conf["min_decision_specific_quality"]:
-            reasons.append(f"decision_specific_quality baixa ({decision_specific_quality:.3f})")
-        if subdivision_required and subdivision_quality < conf["min_subdivision_quality"]:
-            reasons.append(f"subdivision_quality baixa ({subdivision_quality:.3f})")
-        if margin < eff_thr:
-            reasons.append(f"margem insuficiente ({margin:.4f} < {eff_thr:.4f})")
-        if decision_quality < conf["min_decision_quality"]:
-            reasons.append(f"decision_quality baixa ({decision_quality:.3f})")
-        if bootstrap_stability < conf["min_bootstrap_stability"]:
-            reasons.append(f"bootstrap baixo ({bootstrap_stability:.2f})")
-        refusal_reason = "; ".join(reasons) if reasons else "Incerteza combinada"
+        final_ts="4/4"; status="ambiguous"; conf_label="inconclusiva"
+        refusal_reason="; ".join(dict.fromkeys(reasons)) if reasons else "Incerteza estrutural"
 
-    pulse_ql_map = {"2/4": 1.0, "3/4": 1.0, "4/4": 1.0, "6/8": 1.5, "3/2": 2.0}
-    pulse_ql = pulse_ql_map.get(final_ts, 1.0)
+    pulse_ql_map={"2/4":1.0,"3/4":1.0,"4/4":1.0,"6/8":1.5,"3/2":2.0}
+    pulse_ql=pulse_ql_map.get(final_ts,1.0)
 
-    avg_rels = {
-        k: float(np.mean([e["reliabilities"][k] for e in seg_evals_chosen]))
-        for k in ("periodicity", "accent", "subdivision", "harmonic_change", "recurrence", "bass")
-    }
+    # Se só existe uma seção local, sincroniza a timeline com o consenso global final.
+    # Mudanças reais de múltiplas seções continuam preservadas.
+    if status == "detected" and len(meter_sections) == 1 and meter_sections[0]["time_sig"] != best_ts:
+        meter_sections = [{"start_sec":0.0,"time_sig":best_ts}]
 
-    log.add("\n==============================\nHIERARCHICAL METER & JOINT BOOTSTRAP ENGINE\n==============================")
-    log.add(f"Tactus avaliados conjuntamente: {[round(float(t['bpm']), 2) for t in top_tactus]}")
-    log.add("Top Hipóteses Conjuntas (Tactus + Agrupamento + Subdivisão + Fase):")
-    for h_i in joint_hypotheses[:10]:
-        log.add(
-            f"  H: {h_i['tactus_bpm']:6.2f} BPM | {h_i['time_sig']} (grp={h_i['grouping']}, "
-            f"sub={h_i['subdivision']}, phase={h_i['phase']}) -> score={h_i['score']:.5f}, rel={h_i['reliability']:.3f}"
-        )
-    log.add("\nFEATURE RELIABILITY (peso efetivo = peso_base × reliability):")
-    for k_r, v_r in avg_rels.items():
-        w_b = CONFIG_METER.get(f"w_{k_r}", 0.15)
-        log.add(f"  {k_r:16s}: reliability={v_r:.3f} | peso_base={w_b:.2f} -> peso_efetivo={w_b*v_r:.4f}")
+    # ---------- log auditável ----------
+    log.add("\n==============================\nA4.2 TATUM -> PULSE -> BAR ENGINE\n==============================")
+    log.add(f"Tactus avaliados: {[round(float(b),2) for b in candidate_bpms]}")
+    log.add(f"Meter marginalizado/calibrado: { {k:round(v,4) for k,v in meter_scores.items()} }")
+    log.add(f"RAW-GRID CALIBRATION: peso={raw_calibration_weight:.3f} | stats={ {k:round(v,3) for k,v in raw_calibration_stats.items()} } | prior={ {k:round(v,3) for k,v in raw_calibration_prior.items()} }")
+    log.add(f"Melhor compasso={best_ts} ({best_sc:.4f}) | 2º={sec_ts} ({sec_sc:.4f}) | margem={meter_margin:.4f}")
+    log.add(f"Tactus condicionado ao compasso: {chosen_bpm:.2f} BPM | tactus_quality={tactus_quality:.3f}")
+    log.add(f"VITERBI RAW={raw_path} | ESTABILIZADO={path} | Sections={meter_sections}")
+    log.add(f"BOOTSTRAP METER ({n_boot})={meter_boot}")
+    log.add(f"BOOTSTRAP JOINT top={dict(sorted(joint_boot.items(),key=lambda kv:kv[1],reverse=True)[:8])}")
     for e in seg_evals_chosen:
         log.add(
-            f"  Seg {e['pos_label']}: Grp(2={e['grp_scores'][2]:.2f}, 3={e['grp_scores'][3]:.2f}, 4={e['grp_scores'][4]:.2f}) | "
-            f"Beat3_Cont={e['beat3_cont']:.2f} | SubTern={e['sub_tern']:.2f} (rep={e['tern_rep']:.2f}) | "
-            f"TS={ {k: round(v, 2) for k, v in e['ts_probs'].items()} }"
+            f"  Seg {e['pos_label']}: grp={ {k:round(v,3) for k,v in e['grp_scores'].items()} } | "
+            f"compound={e['compound_support']:.3f} (tern={e['sub_tern']:.3f}, rep={e['tern_rep']:.3f}, "
+            f"half={e['half_ratio']:.3f}, thirds={e['third_ratio']:.3f}) | "
+            f"4bar={e['four_hierarchy']:.3f} | rec2={e['rec_abs'][2]:.3f} | "
+            f"TS={ {k:round(v,3) for k,v in e['ts_probs'].items()} }"
         )
-    log.add(f"\nVITERBI RAW: {raw_viterbi_path}")
-    log.add(f"VITERBI ESTABILIZADO: {viterbi_path} | Sections={meter_sections}")
-    log.add(f"BOOTSTRAP JOINT ({n_boot}): {dict(sorted(joint_boot_counts.items(), key=lambda kv: kv[1], reverse=True)[:10])}")
-    log.add(f"Bootstrap por compasso: {meter_boot_counts} | por tactus: {dict(tactus_boot_counts)}")
     log.add(
-        f"Tactus escolhido={chosen_bpm:.2f} (prior={chosen_tactus_score:.3f}, joint={chosen_joint_score:.4f}) | "
-        f"2º joint tactus={second_joint_score:.4f} | margem_tactus_joint={tactus_margin:.4f} | quality={tactus_quality:.3f}"
+        f"QUALITY: signal={tempo_data['signal_quality']:.3f} | tactus={tactus_quality:.3f} | pulse={pulse_quality:.3f} | "
+        f"grouping={grouping_quality:.3f} | subdivision={subdivision_quality:.3f} | hierarchy={hierarchy_quality:.3f} | "
+        f"agreement={feature_agreement:.3f} | meter_confidence={meter_confidence:.3f} | decision={decision_quality:.3f}"
     )
-    log.add("\nQUALITY METRICS (Signal != Decision):")
-    log.add(
-        f"  signal={tempo_data['signal_quality']:.3f} | tactus={tactus_quality:.3f} | grouping={grouping_quality:.3f} | "
-        f"subdivision={subdivision_quality:.3f} | feature_agreement={feature_agreement:.3f}\n"
-        f"  decision_specific={decision_specific_quality:.3f} | sequence={sequence_stability:.3f} | "
-        f"bootstrap_meter={bootstrap_stability:.3f} | bootstrap_joint={joint_hypothesis_stability:.3f} | decision={decision_quality:.3f}"
-    )
-    log.add(
-        f"  Melhor={best_ts} ({best_sc:.4f}) | Segundo={sec_ts} ({sec_sc:.4f}) | Margem={margin:.4f} | "
-        f"Threshold Base={conf['base_margin_threshold']:.4f}, Efetivo={eff_thr:.4f}"
-    )
-    log.add(f"  Status={status} | Confiança={conf_label} | Motivo: {refusal_reason}")
+    log.add(f"Status={status} | Confiança={conf_label} | Threshold={eff_thr:.4f} | Motivo={refusal_reason}")
 
-    qualities_dict = {
-        "signal_quality": round(float(tempo_data["signal_quality"]), 3),
-        "tactus_quality": round(tactus_quality, 3),
-        "grouping_quality": round(grouping_quality, 3),
-        "subdivision_quality": round(subdivision_quality, 3),
-        "feature_agreement": round(feature_agreement, 3),
-        "decision_specific_quality": round(decision_specific_quality, 3),
-        "sequence_stability": round(sequence_stability, 3),
-        "bootstrap_stability": round(bootstrap_stability, 3),
-        "joint_hypothesis_stability": round(joint_hypothesis_stability, 3),
-        "decision_quality": round(decision_quality, 3),
+    qualities={
+        "signal_quality":round(float(tempo_data["signal_quality"]),3),
+        "tactus_quality":round(tactus_quality,3),
+        "pulse_quality":round(pulse_quality,3),
+        "meter_confidence":round(meter_confidence,3),
+        "grouping_quality":round(grouping_quality,3),
+        "subdivision_quality":round(subdivision_quality,3),
+        "feature_agreement":round(feature_agreement,3),
+        "decision_specific_quality":round(decision_specific_quality,3),
+        "sequence_stability":round(sequence_stability,3),
+        "bootstrap_stability":round(bootstrap_stability,3),
+        "joint_hypothesis_stability":round(joint_stability,3),
+        "decision_quality":round(decision_quality,3),
     }
-
     return {
-        "chosen_bpm": round(chosen_bpm, 1),
-        "time_sig": final_ts,
-        "status": status,
-        "best_cand": best_ts,
-        "second_cand": sec_ts,
-        "margin": round(margin, 4),
-        "confidence_label": conf_label,
-        "pulse_ql": pulse_ql,
-        "meter_sections": meter_sections if status == "detected" else [{"start_sec": 0.0, "time_sig": "4/4"}],
-        "qualities": qualities_dict,
+        "chosen_bpm":round(float(chosen_bpm),1),
+        "time_sig":final_ts,
+        "status":status,
+        "best_cand":best_ts,
+        "second_cand":sec_ts,
+        "margin":round(meter_margin,4),
+        "confidence_label":conf_label,
+        "pulse_ql":pulse_ql,
+        "meter_sections":meter_sections if status=="detected" else [{"start_sec":0.0,"time_sig":"4/4"}],
+        "qualities":qualities,
     }
 
 
