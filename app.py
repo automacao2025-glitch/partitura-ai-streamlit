@@ -85,7 +85,7 @@ OUTPUT_DIR = Path("temp_outputs")
 for d in [UPLOAD_DIR, OUTPUT_DIR]:
     d.mkdir(exist_ok=True)
 
-APP_VERSION = "A4.0.1-Hierarchical-Inference"
+APP_VERSION = "A4.1-Optimized-Hierarchical-Inference"
 
 # ---------------------------------------------------------
 # 1. SISTEMA DE AUDITORIA E LOG TÉCNICO
@@ -145,6 +145,14 @@ CONFIG_TACTUS = {
     "tatum_subdivisions": 6,
     "segment_positions": (0.15, 0.38, 0.62, 0.85),
     "segment_window_sec": 18.0,
+    # Seleção tardia: não elimina cedo demais candidatos metricamente plausíveis.
+    "joint_min_candidates": 5,
+    "joint_max_candidates": 8,
+    "joint_keep_ratio": 0.78,
+    # O prior perceptual é apenas desempate; a evidência acústica domina.
+    "w_acoustic": 0.54,
+    "w_alignment": 0.38,
+    "w_perceptual_prior": 0.08,
 }
 
 CONFIG_METER = {
@@ -162,12 +170,15 @@ CONFIG_METER = {
 
 CONFIG_CONFIDENCE = {
     "bootstrap_iterations": 40,
-    "min_decision_quality": 0.46,
+    "min_decision_quality": 0.50,
     "min_bootstrap_stability": 0.58,
     "min_feature_agreement": 0.42,
+    "min_grouping_quality": 0.055,
+    "min_subdivision_quality": 0.075,
+    "min_decision_specific_quality": 0.075,
     "base_margin_threshold": 0.060,
-    "min_margin_abs": 0.025,
-    "max_margin_abs": 0.140,
+    "min_margin_abs": 0.060,
+    "max_margin_abs": 0.150,
 }
 
 CONFIG_MELODY = {
@@ -199,8 +210,13 @@ CONFIG_HARMONY = {
     "quality_min_confidence": 0.40,
     "quality_min_margin": 0.045,
     "third_presence_min_ratio": 0.14,
-    "hmm_stay_prob": 0.76,
+    "hmm_stay_prob": 0.70,
     "tonal_prior_weight": 0.12,
+    # Evidência local forte não pode ser apagada por oversmoothing do HMM.
+    "local_override_root_conf": 0.72,
+    "local_override_quality_conf": 0.64,
+    "local_override_margin": 0.075,
+    "local_override_chord_conf": 0.68,
 }
 
 CONFIG_QUANTIZATION = {
@@ -457,6 +473,20 @@ def analyze_unified_tempo_and_tatums(y_full, sr, log: TechnicalLogger):
         seg_bpm = float(ts_arr[0]) if (ts_arr.size > 0 and math.isfinite(float(ts_arr[0])) and float(ts_arr[0]) > 0) else global_raw_bpm
         b_times_seg = librosa.frames_to_time(b_seg + f0, sr=sr, hop_length=hop)
 
+        # Features pesadas independentes do tactus: calcula uma vez e reutiliza.
+        try:
+            tg_seg = librosa.feature.tempogram(onset_envelope=env_seg, sr=sr, hop_length=hop)
+            tg_ac = np.mean(tg_seg, axis=1)
+            tg_ac = tg_ac / (np.max(tg_ac) + 1e-8)
+        except Exception:
+            tg_ac = np.zeros(max(2, len(env_seg)), dtype=float)
+        try:
+            s0_samples = max(0, int(f0 * hop))
+            s1_samples = min(len(y_harm), int(f1 * hop))
+            chroma_seg = librosa.feature.chroma_cqt(y=y_harm[s0_samples:s1_samples], sr=sr, hop_length=hop)
+        except Exception:
+            chroma_seg = None
+
         segments.append({
             "position": pos,
             "pos_label": f"{int(pos*100)}%",
@@ -468,6 +498,8 @@ def analyze_unified_tempo_and_tatums(y_full, sr, log: TechnicalLogger):
             "beat_frames_local": b_seg,
             "beat_times": b_times_seg,
             "onset_env": env_seg,
+            "tempogram_ac": tg_ac,
+            "chroma": chroma_seg,
         })
 
     raw_pool = [global_raw_bpm] + [s["bpm"] for s in segments]
@@ -503,12 +535,16 @@ def analyze_unified_tempo_and_tatums(y_full, sr, log: TechnicalLogger):
 
         seg_align = []
         for s in segments:
-            errs = [abs(cand - s["bpm"] * r) / cand for r in (0.5, 2.0/3.0, 1.0, 1.5, 2.0)]
+            errs = [abs(cand - s["bpm"] * r) / max(cand, 1e-8) for r in CONFIG_TACTUS["ratios"]]
             seg_align.append(max(0.0, 1.0 - min(errs) * 4.5))
         align_sc = float(np.mean(seg_align)) if seg_align else 0.5
 
         perc_prior = math.exp(-0.5 * ((cand - CONFIG_TACTUS["perceptual_center_bpm"]) / CONFIG_TACTUS["perceptual_sigma_bpm"]) ** 2)
-        fam_score = 0.46 * ac_sc + 0.32 * align_sc + 0.22 * perc_prior
+        fam_score = (
+            CONFIG_TACTUS["w_acoustic"] * ac_sc +
+            CONFIG_TACTUS["w_alignment"] * align_sc +
+            CONFIG_TACTUS["w_perceptual_prior"] * perc_prior
+        )
         tactus_family.append({
             "bpm": cand,
             "score": round(fam_score, 4),
@@ -518,7 +554,7 @@ def analyze_unified_tempo_and_tatums(y_full, sr, log: TechnicalLogger):
         })
 
     tactus_family.sort(key=lambda x: x["score"], reverse=True)
-    top_tactus_candidates = tactus_family[:5]
+    top_tactus_candidates = tactus_family[:CONFIG_TACTUS["joint_max_candidates"]]
 
     onset_peaks_frames = librosa.onset.onset_detect(onset_envelope=onset_norm, sr=sr, hop_length=hop, backtrack=False)
     onset_peaks_times = librosa.frames_to_time(onset_peaks_frames, sr=sr, hop_length=hop)
@@ -680,9 +716,11 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
     beat_times_local = librosa.frames_to_time(beats + seg["frame_start"], sr=sr, hop_length=hop)
     frames_per_beat = max(2, int(round((60.0 / cand_bpm * sr) / hop)))
 
-    tg = librosa.feature.tempogram(onset_envelope=env, sr=sr, hop_length=hop)
-    ac = np.mean(tg, axis=1)
-    ac = ac / (np.max(ac) + 1e-8)
+    ac = seg.get("tempogram_ac")
+    if ac is None or len(ac) < 2:
+        tg = librosa.feature.tempogram(onset_envelope=env, sr=sr, hop_length=hop)
+        ac = np.mean(tg, axis=1)
+        ac = ac / (np.max(ac) + 1e-8)
 
     def _lag_e(mult):
         lg = int(round(frames_per_beat * mult))
@@ -702,8 +740,15 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
     b_z = (b_acc - np.mean(b_acc)) / (np.std(b_acc) + 1e-8)
 
     try:
-        chroma = librosa.feature.chroma_cqt(y=y_harm_seg, sr=sr, hop_length=hop)
-        c_sync = librosa.util.sync(chroma, beats)
+        chroma = seg.get("chroma")
+        if chroma is None:
+            chroma = librosa.feature.chroma_cqt(y=y_harm_seg, sr=sr, hop_length=hop)
+        # beat frames são locais ao segmento; limita índices ao domínio do chroma.
+        beats_sync = np.asarray(beats, dtype=int)
+        beats_sync = beats_sync[(beats_sync >= 0) & (beats_sync < chroma.shape[1])]
+        if len(beats_sync) < 2:
+            raise ValueError("Poucos beats válidos para sincronização de chroma")
+        c_sync = librosa.util.sync(chroma, beats_sync)
         c_norm = c_sync / (np.linalg.norm(c_sync, axis=0, keepdims=True) + 1e-8)
         h_diff = np.sqrt(np.sum(np.diff(c_norm, axis=1) ** 2, axis=0))
         h_diff = np.pad(h_diff, (1, 0), mode="edge")
@@ -801,11 +846,12 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
     p_sub_bin, p_sub_tern, sub_rel, tern_rep = _compute_inner_pulse_subdivision(onset_peaks_times, beat_times_local)
 
     wm = CONFIG_METER
-    eff_w_per = wm["w_periodicity"] * (0.25 + 0.75 * per_rel)
-    eff_w_acc = wm["w_accent"] * (0.25 + 0.75 * acc_rel)
-    eff_w_harm = wm["w_harmonic_change"] * (0.20 + 0.80 * harm_rel)
-    eff_w_rec = wm["w_recurrence"] * (0.20 + 0.80 * rec_rel)
-    eff_w_bass = wm["w_bass"] * (0.20 + 0.80 * bass_rel)
+    eps_rel = 1e-4
+    eff_w_per = wm["w_periodicity"] * max(eps_rel, per_rel)
+    eff_w_acc = wm["w_accent"] * max(eps_rel, acc_rel)
+    eff_w_harm = wm["w_harmonic_change"] * max(eps_rel, harm_rel)
+    eff_w_rec = wm["w_recurrence"] * max(eps_rel, rec_rel)
+    eff_w_bass = wm["w_bass"] * max(eps_rel, bass_rel)
     w_sum_grp = eff_w_per + eff_w_acc + eff_w_harm + eff_w_rec + eff_w_bass + 1e-8
 
     grp_scores = {}
@@ -836,6 +882,7 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
         max(acc_probs.items(), key=lambda x: x[1])[0] == top_g,
         max(harm_probs.items(), key=lambda x: x[1])[0] == top_g,
         max(rec_probs.items(), key=lambda x: x[1])[0] == top_g,
+        max(bass_probs.items(), key=lambda x: x[1])[0] == top_g,
     ]
     feature_agreement = float(np.mean(feat_votes))
 
@@ -843,11 +890,17 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
     eff_sub_bin = 1.0 - eff_sub_tern
 
     sc_2_4 = grp_scores[2] * (0.55 + 0.45 * eff_sub_bin)
-    sc_6_8 = grp_scores[2] * (0.35 + 0.65 * eff_sub_tern) * (1.15 if tern_rep >= 0.35 else 0.72)
+    # Curva contínua: evita saltos artificiais perto de um threshold fixo.
+    tern_x = float(np.clip((tern_rep - 0.18) / 0.50, 0.0, 1.0))
+    tern_smooth = tern_x * tern_x * (3.0 - 2.0 * tern_x)  # smoothstep
+    tern_factor = 0.72 + 0.43 * tern_smooth
+    sc_6_8 = grp_scores[2] * (0.35 + 0.65 * eff_sub_tern) * tern_factor
 
-    slow_pulse_factor = float(np.clip((92.0 - cand_bpm) / 45.0, 0.15, 0.85))
-    sc_3_4 = grp_scores[3] * (1.0 - 0.35 * slow_pulse_factor)
-    sc_3_2 = grp_scores[3] * (0.45 + 0.55 * slow_pulse_factor)
+    # 3/4 x 3/2: BPM é apenas evidência auxiliar, nunca regra decisiva.
+    slow_pulse_factor = float(np.clip((96.0 - cand_bpm) / 70.0, 0.0, 1.0))
+    long_level_support = float(np.clip(0.50 * slow_pulse_factor + 0.50 * per_rel, 0.0, 1.0))
+    sc_3_4 = grp_scores[3] * (0.88 - 0.18 * long_level_support)
+    sc_3_2 = grp_scores[3] * (0.38 + 0.32 * long_level_support)
 
     sc_4_4 = grp_scores[4] * (0.60 + 0.40 * eff_sub_bin)
 
@@ -880,6 +933,7 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
             "bass": bass_rel,
         },
         "feature_agreement": feature_agreement,
+        "beat3_quality": b3_rel,
     }
 
 
@@ -900,270 +954,390 @@ def extract_meter_features(joint_hypotheses, quality_metrics) -> dict:
     }
 
 
+def _select_joint_tactus_candidates(tempo_data):
+    family = list(tempo_data.get("tactus_family", []))
+    if not family:
+        return []
+    family.sort(key=lambda x: x["score"], reverse=True)
+    min_n = int(CONFIG_TACTUS["joint_min_candidates"])
+    max_n = int(CONFIG_TACTUS["joint_max_candidates"])
+    keep_ratio = float(CONFIG_TACTUS["joint_keep_ratio"])
+    top_score = max(1e-8, float(family[0]["score"]))
+    selected = []
+    for cand in family:
+        if len(selected) < min_n or (len(selected) < max_n and float(cand["score"]) >= top_score * keep_ratio):
+            selected.append(cand)
+        if len(selected) >= max_n:
+            break
+    return selected
+
+
+def _stabilize_meter_path(path, min_run=2):
+    if len(path) < 3 or min_run <= 1:
+        return list(path)
+    out = list(path)
+    changed = True
+    passes = 0
+    while changed and passes < 2:
+        changed = False
+        passes += 1
+        runs = []
+        i = 0
+        while i < len(out):
+            j = i + 1
+            while j < len(out) and out[j] == out[i]:
+                j += 1
+            runs.append((i, j, out[i]))
+            i = j
+        for r_i, (a, b, val) in enumerate(runs):
+            if (b - a) >= min_run:
+                continue
+            left = runs[r_i - 1][2] if r_i > 0 else None
+            right = runs[r_i + 1][2] if r_i + 1 < len(runs) else None
+            replacement = left if left is not None else right
+            if left is not None and right is not None and left == right:
+                replacement = left
+            if replacement is not None and replacement != val:
+                for k in range(a, b):
+                    out[k] = replacement
+                changed = True
+    return out
+
+
 def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: TechnicalLogger):
     segments = tempo_data["segments"]
-    top_tactus = tempo_data["top_tactus"][:3]
+    top_tactus = _select_joint_tactus_candidates(tempo_data)
     y_harm = tempo_data["y_harm"]
     y_perc = tempo_data["y_perc"]
     onset_peaks = tempo_data["onset_peaks_times"]
     hop = CONFIG_SIGNAL["hop_length"]
 
+    fallback = {
+        "chosen_bpm": tempo_data["global_raw_bpm"],
+        "time_sig": "4/4",
+        "status": "ambiguous",
+        "confidence_label": "inconclusiva",
+        "pulse_ql": 1.0,
+        "meter_sections": [{"start_sec": 0.0, "time_sig": "4/4"}],
+        "qualities": {
+            "signal_quality": round(float(tempo_data.get("signal_quality", 0.5)), 3),
+            "beat_quality": 0.5,
+            "tactus_quality": 0.0,
+            "grouping_quality": 0.0,
+            "subdivision_quality": 0.0,
+            "feature_agreement": 0.0,
+            "decision_specific_quality": 0.0,
+            "sequence_stability": 0.0,
+            "bootstrap_stability": 0.0,
+            "joint_hypothesis_stability": 0.0,
+            "decision_quality": 0.0,
+        },
+    }
     if not segments or not top_tactus:
-        return {
-            "chosen_bpm": tempo_data["global_raw_bpm"],
-            "time_sig": "4/4",
-            "status": "ambiguous",
-            "confidence_label": "inconclusiva",
-            "pulse_ql": 1.0,
-            "meter_sections": [{"start_sec": 0.0, "time_sig": "4/4"}],
-            "qualities": {
-                "signal_quality": tempo_data["signal_quality"],
-                "beat_quality": 0.5,
-                "tactus_quality": 0.5,
-                "grouping_quality": 0.0,
-                "subdivision_quality": 0.0,
-                "feature_agreement": 0.0,
-                "sequence_stability": 0.0,
-                "bootstrap_stability": 0.0,
-                "decision_quality": 0.0,
-            }
-        }
+        return fallback
+
+    states = ["2/4", "3/4", "4/4", "6/8", "3/2"]
+    grp_map = {"2/4": 2, "6/8": 2, "3/4": 3, "3/2": 3, "4/4": 4}
+    sub_map = {"2/4": "simples", "3/4": "semínima", "4/4": "simples", "6/8": "composto", "3/2": "mínima"}
 
     joint_hypotheses = []
     tactus_evaluations = {}
+    tactus_meta = {round(float(t["bpm"]), 2): t for t in top_tactus}
 
     for t_cand in top_tactus:
-        c_bpm = t_cand["bpm"]
-        t_prior = t_cand["score"]
+        c_bpm = float(t_cand["bpm"])
+        t_prior = float(t_cand["score"])
         seg_evals = []
-
         for s in segments:
             s0 = s["frame_start"] * hop
             s1 = s["frame_end"] * hop
             s_notes = [n for n in dedup_notes if s["time_start"] <= n.start_sec <= s["time_end"]]
-            ev = _evaluate_segment_for_tactus(
-                s, y_harm[s0:s1], y_perc[s0:s1], sr, c_bpm, onset_peaks, s_notes
-            )
+            ev = _evaluate_segment_for_tactus(s, y_harm[s0:s1], y_perc[s0:s1], sr, c_bpm, onset_peaks, s_notes)
             if ev is not None:
                 ev["pos_label"] = s["pos_label"]
                 ev["time_start"] = s["time_start"]
                 seg_evals.append(ev)
-
         if not seg_evals:
             continue
-
         tactus_evaluations[c_bpm] = seg_evals
-        candidates_ts = ["2/4", "3/4", "4/4", "6/8", "3/2"]
 
-        for ts in candidates_ts:
+        for ts in states:
             mean_ts_prob = float(np.mean([e["ts_probs"][ts] for e in seg_evals]))
             mean_fa = float(np.mean([e["feature_agreement"] for e in seg_evals]))
             mean_gq = float(np.mean([e["grouping_quality"] for e in seg_evals]))
             mean_sq = float(np.mean([e["sub_rel"] for e in seg_evals]))
             rep_phase = int(np.median([e["phases"][ts] for e in seg_evals]))
-
-            grp_map = {"2/4": 2, "6/8": 2, "3/4": 3, "3/2": 3, "4/4": 4}
-            sub_map = {"2/4": "simples", "3/4": "semínima", "4/4": "simples", "6/8": "composto", "3/2": "mínima"}
-
-            joint_score = mean_ts_prob * (0.65 + 0.35 * t_prior) * (0.75 + 0.25 * mean_fa)
             joint_rel = 0.45 * mean_gq + 0.30 * mean_fa + 0.25 * mean_sq
-
+            # O score acústico manda; o prior de tactus só modula suavemente.
+            joint_score = mean_ts_prob * (0.78 + 0.22 * t_prior) * (0.70 + 0.30 * mean_fa) * (0.78 + 0.22 * joint_rel)
             joint_hypotheses.append({
                 "tactus_bpm": c_bpm,
                 "time_sig": ts,
                 "grouping": grp_map[ts],
                 "subdivision": sub_map[ts],
                 "phase": rep_phase,
-                "score": round(joint_score, 4),
-                "ts_prob": round(mean_ts_prob, 4),
+                "score": round(joint_score, 5),
+                "ts_prob": round(mean_ts_prob, 5),
                 "reliability": round(joint_rel, 4),
-                "grp_2": round(float(np.mean([e["grp_scores"][2] for e in seg_evals])), 3),
-                "grp_3": round(float(np.mean([e["grp_scores"][3] for e in seg_evals])), 3),
-                "grp_4": round(float(np.mean([e["grp_scores"][4] for e in seg_evals])), 3),
-                "sub_tern": round(float(np.mean([e["sub_tern"] for e in seg_evals])), 3),
-                "beat3_cont": round(float(np.mean([e["beat3_cont"] for e in seg_evals])), 3),
+                "grp_2": round(float(np.mean([e["grp_scores"][2] for e in seg_evals])), 4),
+                "grp_3": round(float(np.mean([e["grp_scores"][3] for e in seg_evals])), 4),
+                "grp_4": round(float(np.mean([e["grp_scores"][4] for e in seg_evals])), 4),
+                "sub_tern": round(float(np.mean([e["sub_tern"] for e in seg_evals])), 4),
+                "beat3_cont": round(float(np.mean([e["beat3_cont"] for e in seg_evals])), 4),
             })
 
     if not joint_hypotheses:
-        return {
-            "chosen_bpm": tempo_data["global_raw_bpm"],
-            "time_sig": "4/4",
-            "status": "ambiguous",
-            "confidence_label": "inconclusiva",
-            "pulse_ql": 1.0,
-            "meter_sections": [{"start_sec": 0.0, "time_sig": "4/4"}],
-            "qualities": {
-                "signal_quality": tempo_data["signal_quality"],
-                "beat_quality": 0.5,
-                "tactus_quality": 0.5,
-                "grouping_quality": 0.0,
-                "subdivision_quality": 0.0,
-                "feature_agreement": 0.0,
-                "sequence_stability": 0.0,
-                "bootstrap_stability": 0.0,
-                "decision_quality": 0.0,
-            }
-        }
+        return fallback
 
     joint_hypotheses.sort(key=lambda x: x["score"], reverse=True)
     best_h = joint_hypotheses[0]
-    chosen_bpm = best_h["tactus_bpm"]
+    chosen_bpm = float(best_h["tactus_bpm"])
     seg_evals_chosen = tactus_evaluations[chosen_bpm]
 
-    states = ["2/4", "3/4", "4/4", "6/8", "3/2"]
+    # Viterbi temporal no tactus vencedor.
     n_st = len(states)
     n_win = len(seg_evals_chosen)
     self_p = CONFIG_METER["viterbi_self_transition"]
     switch_p = (1.0 - self_p) / float(n_st - 1)
-
     dp = np.zeros((n_win, n_st), dtype=float)
     back = np.zeros((n_win, n_st), dtype=int)
-
     for s_i, st_name in enumerate(states):
         dp[0, s_i] = math.log(seg_evals_chosen[0]["ts_probs"][st_name] + 1e-9)
-
     for t in range(1, n_win):
         for s_curr, st_name in enumerate(states):
             em = math.log(seg_evals_chosen[t]["ts_probs"][st_name] + 1e-9)
-            scores_prev = [
-                dp[t - 1, s_prev] + math.log(self_p if s_prev == s_curr else switch_p) + em
+            prev_scores = np.array([
+                dp[t - 1, s_prev] + math.log(self_p if s_prev == s_curr else switch_p)
                 for s_prev in range(n_st)
-            ]
-            best_prev = int(np.argmax(scores_prev))
-            dp[t, s_curr] = scores_prev[best_prev]
+            ])
+            best_prev = int(np.argmax(prev_scores))
+            dp[t, s_curr] = float(prev_scores[best_prev] + em)
             back[t, s_curr] = best_prev
-
     viterbi_idx = [int(np.argmax(dp[-1]))]
     for t in range(n_win - 1, 0, -1):
         viterbi_idx.append(int(back[t, viterbi_idx[-1]]))
     viterbi_idx.reverse()
-    viterbi_path = [states[i] for i in viterbi_idx]
+    raw_viterbi_path = [states[i] for i in viterbi_idx]
+    viterbi_path = _stabilize_meter_path(raw_viterbi_path, int(CONFIG_METER["viterbi_section_min_windows"]))
 
     meter_sections = []
     for t, st_name in enumerate(viterbi_path):
-        t_sec = 0.0 if t == 0 else round(seg_evals_chosen[t]["time_start"], 2)
+        t_sec = 0.0 if t == 0 else round(float(seg_evals_chosen[t]["time_start"]), 2)
         if not meter_sections or meter_sections[-1]["time_sig"] != st_name:
             meter_sections.append({"start_sec": t_sec, "time_sig": st_name})
 
-    sequence_stability = float(viterbi_path.count(viterbi_path[0]) / float(len(viterbi_path)))
+    transitions = sum(1 for i in range(1, len(viterbi_path)) if viterbi_path[i] != viterbi_path[i - 1])
+    transition_rate = transitions / float(max(1, len(viterbi_path) - 1))
+    dominant_ratio = max(viterbi_path.count(s) for s in set(viterbi_path)) / float(len(viterbi_path))
+    sequence_stability = float(np.clip(0.55 * dominant_ratio + 0.45 * (1.0 - transition_rate), 0.0, 1.0))
 
-    rng = np.random.default_rng(42)
-    n_boot = CONFIG_CONFIDENCE["bootstrap_iterations"]
-    boot_counts = {c: 0 for c in states}
-
-    for _ in range(n_boot):
-        sampled_evals = rng.choice(seg_evals_chosen, size=len(seg_evals_chosen), replace=True)
-        agg = {c: 0.0 for c in states}
-        for ev in sampled_evals:
-            noise_scale = 0.06 * (1.0 - ev["grouping_quality"])
-            for c in states:
-                agg[c] += max(0.0, ev["ts_probs"][c] + float(rng.normal(0.0, noise_scale)))
-        win_c = max(agg.items(), key=lambda x: x[1])[0]
-        boot_counts[win_c] += 1
-
+    # Scores globais no tactus vencedor.
     global_ts_scores = {c: float(np.mean([e["ts_probs"][c] for e in seg_evals_chosen])) for c in states}
     g_tot = sum(global_ts_scores.values()) + 1e-8
     global_ts_scores = {k: v / g_tot for k, v in global_ts_scores.items()}
-
     ranked_ts = sorted(global_ts_scores.items(), key=lambda x: x[1], reverse=True)
     best_ts, best_sc = ranked_ts[0]
     sec_ts, sec_sc = ranked_ts[1]
-    margin = best_sc - sec_sc
+    margin = float(best_sc - sec_sc)
 
-    bootstrap_stability = boot_counts[best_ts] / float(n_boot)
+    # Bootstrap conjunto: cada rodada reavalia tactus + fórmula de compasso usando features já calculadas.
+    rng = np.random.default_rng(42)
+    n_boot = int(CONFIG_CONFIDENCE["bootstrap_iterations"])
+    joint_boot_counts = defaultdict(int)
+    meter_boot_counts = {c: 0 for c in states}
+    tactus_boot_counts = defaultdict(int)
+    for _ in range(n_boot):
+        run_candidates = []
+        for t_cand in top_tactus:
+            c_bpm = float(t_cand["bpm"])
+            evals = tactus_evaluations.get(c_bpm, [])
+            if not evals:
+                continue
+            idx = rng.integers(0, len(evals), size=len(evals))
+            sampled = [evals[int(i)] for i in idx]
+            mean_fa = float(np.mean([e["feature_agreement"] for e in sampled]))
+            mean_gq = float(np.mean([e["grouping_quality"] for e in sampled]))
+            mean_sq = float(np.mean([e["sub_rel"] for e in sampled]))
+            rel = 0.45 * mean_gq + 0.30 * mean_fa + 0.25 * mean_sq
+            t_prior = float(t_cand["score"])
+            for ts in states:
+                p_ts = float(np.mean([e["ts_probs"][ts] for e in sampled]))
+                noise = float(rng.normal(0.0, 0.018 * (1.0 - mean_gq)))
+                j_sc = max(0.0, p_ts + noise) * (0.78 + 0.22 * t_prior) * (0.70 + 0.30 * mean_fa) * (0.78 + 0.22 * rel)
+                run_candidates.append((j_sc, c_bpm, ts))
+        if run_candidates:
+            _, b_bpm, b_ts = max(run_candidates, key=lambda x: x[0])
+            key = (round(b_bpm, 2), b_ts)
+            joint_boot_counts[key] += 1
+            meter_boot_counts[b_ts] += 1
+            tactus_boot_counts[round(b_bpm, 2)] += 1
 
-    tactus_quality = float(top_tactus[0]["score"])
+    target_pair = (round(chosen_bpm, 2), best_ts)
+    joint_hypothesis_stability = joint_boot_counts[target_pair] / float(max(1, n_boot))
+    bootstrap_stability = meter_boot_counts[best_ts] / float(max(1, n_boot))
+
+    # Qualidade do tactus realmente escolhido + margem para o melhor rival.
+    chosen_meta = tactus_meta.get(round(chosen_bpm, 2), {})
+    chosen_tactus_score = float(chosen_meta.get("score", 0.0))
+    # A margem do tactus deve ser medida no problema conjunto (tactus + meter),
+    # não apenas no ranking preliminar de BPM.
+    best_joint_by_tactus = {}
+    for h in joint_hypotheses:
+        b_key = round(float(h["tactus_bpm"]), 2)
+        best_joint_by_tactus[b_key] = max(best_joint_by_tactus.get(b_key, 0.0), float(h["score"]))
+    chosen_joint_score = best_joint_by_tactus.get(round(chosen_bpm, 2), 0.0)
+    rival_joint_scores = [v for k, v in best_joint_by_tactus.items() if abs(k - round(chosen_bpm, 2)) > 1e-6]
+    second_joint_score = max(rival_joint_scores) if rival_joint_scores else 0.0
+    tactus_margin = max(0.0, chosen_joint_score - second_joint_score)
+    tactus_quality = float(np.clip(0.65 * chosen_tactus_score + 0.35 * min(1.0, tactus_margin / 0.08), 0.0, 1.0))
+
     grouping_quality = float(np.mean([e["grouping_quality"] for e in seg_evals_chosen]))
     subdivision_quality = float(np.mean([e["sub_rel"] for e in seg_evals_chosen]))
     feature_agreement = float(np.mean([e["feature_agreement"] for e in seg_evals_chosen]))
+    beat3_quality = float(np.mean([e.get("beat3_quality", 0.0) for e in seg_evals_chosen]))
 
+    pair_set = {best_ts, sec_ts}
+    if pair_set == {"2/4", "6/8"}:
+        # Compasso composto exige evidência ternária positiva e repetida.
+        # Combina template interno e repetição para não depender de 0.51 vs 0.49.
+        mean_sub_tern = float(np.mean([e["sub_tern"] for e in seg_evals_chosen]))
+        mean_tern_rep = float(np.mean([e["tern_rep"] for e in seg_evals_chosen]))
+        compound_support = float(np.clip(0.55 * mean_sub_tern + 0.45 * mean_tern_rep, 0.0, 1.0))
+        compound_reliability = binary_reliability(compound_support)
+        decision_specific_quality = max(subdivision_quality, compound_reliability)
+    elif pair_set == {"2/4", "4/4"}:
+        decision_specific_quality = beat3_quality
+    elif pair_set == {"3/4", "3/2"}:
+        decision_specific_quality = float(np.clip(0.55 * tactus_quality + 0.45 * grouping_quality, 0.0, 1.0))
+    else:
+        decision_specific_quality = float(np.clip(0.55 * grouping_quality + 0.45 * feature_agreement, 0.0, 1.0))
+
+    margin_quality = min(1.0, margin / max(CONFIG_CONFIDENCE["base_margin_threshold"], 1e-8))
     decision_quality = float(np.clip(
-        0.28 * min(1.0, margin * 6.0) +
-        0.24 * bootstrap_stability +
-        0.20 * feature_agreement +
-        0.16 * grouping_quality +
-        0.12 * sequence_stability,
+        0.20 * margin_quality +
+        0.16 * joint_hypothesis_stability +
+        0.12 * bootstrap_stability +
+        0.14 * feature_agreement +
+        0.14 * grouping_quality +
+        0.12 * decision_specific_quality +
+        0.07 * tactus_quality +
+        0.05 * tempo_data["signal_quality"],
         0.0, 1.0
     ))
 
-    base_thr = CONFIG_CONFIDENCE["base_margin_threshold"]
-    adj_thr = -0.025 * (decision_quality - 0.55) - 0.020 * (bootstrap_stability - 0.65)
-    eff_thr = float(np.clip(base_thr + adj_thr, CONFIG_CONFIDENCE["min_margin_abs"], CONFIG_CONFIDENCE["max_margin_abs"]))
+    # Evidência fraca deixa o threshold MAIS rigoroso, nunca mais permissivo.
+    conf = CONFIG_CONFIDENCE
+    penalty = 0.0
+    if grouping_quality < conf["min_grouping_quality"]:
+        penalty += 0.040 * (1.0 - grouping_quality / max(conf["min_grouping_quality"], 1e-8))
+    if decision_specific_quality < conf["min_decision_specific_quality"]:
+        penalty += 0.030 * (1.0 - decision_specific_quality / max(conf["min_decision_specific_quality"], 1e-8))
+    if feature_agreement < conf["min_feature_agreement"]:
+        penalty += 0.025 * (1.0 - feature_agreement / max(conf["min_feature_agreement"], 1e-8))
+    eff_thr = float(np.clip(conf["base_margin_threshold"] + penalty, conf["base_margin_threshold"], conf["max_margin_abs"]))
 
-    if (
+    # 6/8 exige evidência ternária positiva. Para 2/4, a ausência de evidência
+    # composta forte pode ser suficiente quando grouping/bootstrap são robustos.
+    subdivision_required = (best_ts == "6/8")
+    hard_quality_ok = (
+        grouping_quality >= conf["min_grouping_quality"] and
+        feature_agreement >= conf["min_feature_agreement"] and
+        decision_specific_quality >= conf["min_decision_specific_quality"] and
+        (not subdivision_required or subdivision_quality >= conf["min_subdivision_quality"])
+    )
+
+    accept = (
         margin >= eff_thr and
-        decision_quality >= CONFIG_CONFIDENCE["min_decision_quality"] and
-        bootstrap_stability >= CONFIG_CONFIDENCE["min_bootstrap_stability"]
-    ):
+        decision_quality >= conf["min_decision_quality"] and
+        bootstrap_stability >= conf["min_bootstrap_stability"] and
+        hard_quality_ok
+    )
+
+    if accept:
         status = "detected"
         final_ts = best_ts
-        conf_label = "alta" if (decision_quality >= 0.68 and bootstrap_stability >= 0.78) else "média"
-        refusal_reason = "Nenhuma (decisão aceita por consenso estatístico)"
+        conf_label = "alta" if (decision_quality >= 0.70 and joint_hypothesis_stability >= 0.65) else "média"
+        refusal_reason = "Nenhuma (evidência discriminante suficiente)"
     else:
         status = "ambiguous"
         final_ts = "4/4"
         conf_label = "inconclusiva"
-        refusal_reason = (
-            f"Incerteza elevada (margin={margin:.4f} vs thr={eff_thr:.4f}, "
-            f"decision_q={decision_quality:.3f}, bootstrap={bootstrap_stability:.2f})"
-        )
+        reasons = []
+        if grouping_quality < conf["min_grouping_quality"]:
+            reasons.append(f"grouping_quality baixa ({grouping_quality:.3f})")
+        if feature_agreement < conf["min_feature_agreement"]:
+            reasons.append(f"feature_agreement baixo ({feature_agreement:.3f})")
+        if decision_specific_quality < conf["min_decision_specific_quality"]:
+            reasons.append(f"decision_specific_quality baixa ({decision_specific_quality:.3f})")
+        if subdivision_required and subdivision_quality < conf["min_subdivision_quality"]:
+            reasons.append(f"subdivision_quality baixa ({subdivision_quality:.3f})")
+        if margin < eff_thr:
+            reasons.append(f"margem insuficiente ({margin:.4f} < {eff_thr:.4f})")
+        if decision_quality < conf["min_decision_quality"]:
+            reasons.append(f"decision_quality baixa ({decision_quality:.3f})")
+        if bootstrap_stability < conf["min_bootstrap_stability"]:
+            reasons.append(f"bootstrap baixo ({bootstrap_stability:.2f})")
+        refusal_reason = "; ".join(reasons) if reasons else "Incerteza combinada"
 
     pulse_ql_map = {"2/4": 1.0, "3/4": 1.0, "4/4": 1.0, "6/8": 1.5, "3/2": 2.0}
     pulse_ql = pulse_ql_map.get(final_ts, 1.0)
 
-    avg_rels = {}
-    for k_r in ("periodicity", "accent", "subdivision", "harmonic_change", "recurrence", "bass"):
-        avg_rels[k_r] = float(np.mean([e["reliabilities"][k_r] for e in seg_evals_chosen]))
+    avg_rels = {
+        k: float(np.mean([e["reliabilities"][k] for e in seg_evals_chosen]))
+        for k in ("periodicity", "accent", "subdivision", "harmonic_change", "recurrence", "bass")
+    }
 
-    log.add("\n==============================\nHIERARCHICAL METER & VITERBI ENGINE\n==============================")
+    log.add("\n==============================\nHIERARCHICAL METER & JOINT BOOTSTRAP ENGINE\n==============================")
+    log.add(f"Tactus avaliados conjuntamente: {[round(float(t['bpm']), 2) for t in top_tactus]}")
     log.add("Top Hipóteses Conjuntas (Tactus + Agrupamento + Subdivisão + Fase):")
-    for h_i in joint_hypotheses[:6]:
+    for h_i in joint_hypotheses[:10]:
         log.add(
             f"  H: {h_i['tactus_bpm']:6.2f} BPM | {h_i['time_sig']} (grp={h_i['grouping']}, "
-            f"sub={h_i['subdivision']}, phase={h_i['phase']}) -> score={h_i['score']:.4f}, rel={h_i['reliability']:.3f}"
+            f"sub={h_i['subdivision']}, phase={h_i['phase']}) -> score={h_i['score']:.5f}, rel={h_i['reliability']:.3f}"
         )
-
-    log.add("\nFEATURE RELIABILITY (No Tactus Escolhido):")
+    log.add("\nFEATURE RELIABILITY (peso efetivo = peso_base × reliability):")
     for k_r, v_r in avg_rels.items():
         w_b = CONFIG_METER.get(f"w_{k_r}", 0.15)
-        log.add(f"  {k_r:16s}: reliability={v_r:.3f} | peso_base={w_b:.2f} -> peso_efetivo={w_b*(0.25+0.75*v_r):.3f}")
-
+        log.add(f"  {k_r:16s}: reliability={v_r:.3f} | peso_base={w_b:.2f} -> peso_efetivo={w_b*v_r:.4f}")
     for e in seg_evals_chosen:
         log.add(
             f"  Seg {e['pos_label']}: Grp(2={e['grp_scores'][2]:.2f}, 3={e['grp_scores'][3]:.2f}, 4={e['grp_scores'][4]:.2f}) | "
             f"Beat3_Cont={e['beat3_cont']:.2f} | SubTern={e['sub_tern']:.2f} (rep={e['tern_rep']:.2f}) | "
             f"TS={ {k: round(v, 2) for k, v in e['ts_probs'].items()} }"
         )
-
-    log.add(f"\nVITERBI SEQUENCE: {viterbi_path} -> Estado Inicial={viterbi_path[0]} | Final={viterbi_path[-1]}")
-    log.add(f"Meter Sections detectadas: {meter_sections}")
-    log.add(f"BOOTSTRAP ({n_boot} runs): {boot_counts} -> Bootstrap Stability={bootstrap_stability:.2f}")
-
+    log.add(f"\nVITERBI RAW: {raw_viterbi_path}")
+    log.add(f"VITERBI ESTABILIZADO: {viterbi_path} | Sections={meter_sections}")
+    log.add(f"BOOTSTRAP JOINT ({n_boot}): {dict(sorted(joint_boot_counts.items(), key=lambda kv: kv[1], reverse=True)[:10])}")
+    log.add(f"Bootstrap por compasso: {meter_boot_counts} | por tactus: {dict(tactus_boot_counts)}")
+    log.add(
+        f"Tactus escolhido={chosen_bpm:.2f} (prior={chosen_tactus_score:.3f}, joint={chosen_joint_score:.4f}) | "
+        f"2º joint tactus={second_joint_score:.4f} | margem_tactus_joint={tactus_margin:.4f} | quality={tactus_quality:.3f}"
+    )
     log.add("\nQUALITY METRICS (Signal != Decision):")
     log.add(
-        f"  signal_quality={tempo_data['signal_quality']:.3f} | tactus_quality={tactus_quality:.3f} | "
-        f"grouping_quality={grouping_quality:.3f} | subdivision_quality={subdivision_quality:.3f}\n"
-        f"  feature_agreement={feature_agreement:.3f} | sequence_stability={sequence_stability:.3f} | "
-        f"bootstrap_stability={bootstrap_stability:.3f} | decision_quality={decision_quality:.3f}"
+        f"  signal={tempo_data['signal_quality']:.3f} | tactus={tactus_quality:.3f} | grouping={grouping_quality:.3f} | "
+        f"subdivision={subdivision_quality:.3f} | feature_agreement={feature_agreement:.3f}\n"
+        f"  decision_specific={decision_specific_quality:.3f} | sequence={sequence_stability:.3f} | "
+        f"bootstrap_meter={bootstrap_stability:.3f} | bootstrap_joint={joint_hypothesis_stability:.3f} | decision={decision_quality:.3f}"
     )
     log.add(
-        f"  Melhor={best_ts} ({best_sc:.4f}) | Segundo={sec_ts} ({sec_sc:.4f}) | Margem={margin:.4f} "
-        f"(Limiar Base={base_thr:.4f}, Efetivo={eff_thr:.4f})"
+        f"  Melhor={best_ts} ({best_sc:.4f}) | Segundo={sec_ts} ({sec_sc:.4f}) | Margem={margin:.4f} | "
+        f"Threshold Base={conf['base_margin_threshold']:.4f}, Efetivo={eff_thr:.4f}"
     )
     log.add(f"  Status={status} | Confiança={conf_label} | Motivo: {refusal_reason}")
 
     qualities_dict = {
-        "signal_quality": round(tempo_data["signal_quality"], 3),
+        "signal_quality": round(float(tempo_data["signal_quality"]), 3),
         "tactus_quality": round(tactus_quality, 3),
         "grouping_quality": round(grouping_quality, 3),
         "subdivision_quality": round(subdivision_quality, 3),
         "feature_agreement": round(feature_agreement, 3),
+        "decision_specific_quality": round(decision_specific_quality, 3),
         "sequence_stability": round(sequence_stability, 3),
         "bootstrap_stability": round(bootstrap_stability, 3),
+        "joint_hypothesis_stability": round(joint_hypothesis_stability, 3),
         "decision_quality": round(decision_quality, 3),
     }
-
-    _ = extract_meter_features(joint_hypotheses, qualities_dict)
 
     return {
         "chosen_bpm": round(chosen_bpm, 1),
@@ -1174,7 +1348,7 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
         "margin": round(margin, 4),
         "confidence_label": conf_label,
         "pulse_ql": pulse_ql,
-        "meter_sections": meter_sections,
+        "meter_sections": meter_sections if status == "detected" else [{"start_sec": 0.0, "time_sig": "4/4"}],
         "qualities": qualities_dict,
     }
 
@@ -1404,8 +1578,7 @@ def track_melody_viterbi_a4(dedup_notes, onset_norm, sr, log: TechnicalLogger):
         curr_st = int(dp_back[t_idx][curr_st])
     melody_line.reverse()
 
-    if not melody_line and frames:
-        melody_line = [max(f, key=lambda x: x.velocity) for f in frames]
+    # Respeita NO_MELODY: se nenhuma trajetória confiável foi encontrada, não inventa notas.
 
     phrase_resets = 0
     intervals = []
@@ -1471,7 +1644,7 @@ CHORD_QUALITY_SPECS = [
 ]
 
 def analyze_harmony_root_quality_hmm(
-    dedup_notes, y_harm, sr, beat_times, pulse_ql, bar_length_ql, detected_key, log: TechnicalLogger
+    dedup_notes, y_harm, sr, beat_times, pulse_ql, bar_length_ql, time_sig, detected_key, log: TechnicalLogger
 ):
     log.add("\n==============================\nHARMONY ENGINE (ROOT -> QUALITY -> HMM SMOOTHING)\n==============================")
     if not dedup_notes or len(beat_times) < 2:
@@ -1493,14 +1666,8 @@ def analyze_harmony_root_quality_hmm(
     v_h_eff = float(max(CONFIG_HARMONY["velocity_min_floor"], 0.50 * v_h_base + 0.50 * v_h_adapt))
 
     harm_notes = [n for n in dedup_notes if n.velocity >= v_h_eff] or dedup_notes
-    weights_all = np.array([n.duration_sec * (n.velocity / 127.0) for n in harm_notes], dtype=float)
-    w_med, w_p70 = float(np.median(weights_all)), float(np.percentile(weights_all, 70))
-    peso_base = CONFIG_HARMONY["peso_base"]
-    peso_adapt = 0.50 * w_med + 0.50 * w_p70
-    peso_eff = float(max(CONFIG_HARMONY["peso_min_floor"], 0.45 * peso_base + 0.55 * peso_adapt))
 
     log.add(f"VELOCITY HARMONIA -> Base={v_h_base:.1f} | Medido(P28)={v_h_adapt:.1f} | Efetivo={v_h_eff:.1f}")
-    log.add(f"PESO ACORDE       -> Base={peso_base:.3f} | Medido(Med={w_med:.3f}, P70={w_p70:.3f}) | Adapt={peso_adapt:.3f} | Efetivo={peso_eff:.3f}")
 
     try:
         chroma_full = librosa.feature.chroma_cqt(y=y_harm, sr=sr, hop_length=hop)
@@ -1512,22 +1679,47 @@ def analyze_harmony_root_quality_hmm(
         s_ql = seconds_to_musical_position(n.start_sec, beat_times, pulse_ql=pulse_ql)
         e_ql = seconds_to_musical_position(n.end_sec, beat_times, pulse_ql=pulse_ql)
         d_ql = max(0.25, e_ql - s_ql)
-        w_val = n.duration_sec * (n.velocity / 127.0)
+        w_val = d_ql * (n.velocity / 127.0)
         mapped_notes.append((s_ql, e_ql, d_ql, n.pitch, w_val, n.start_sec, n.end_sec))
+
+    weights_all = np.array([x[4] for x in mapped_notes], dtype=float)
+    w_med, w_p70 = float(np.median(weights_all)), float(np.percentile(weights_all, 70))
+    peso_base = CONFIG_HARMONY["peso_base"]
+    peso_adapt = 0.50 * w_med + 0.50 * w_p70
+    peso_eff = float(max(CONFIG_HARMONY["peso_min_floor"], 0.45 * peso_base + 0.55 * peso_adapt))
+    log.add(f"PESO ACORDE (QL)  -> Base={peso_base:.3f} | Medido(Med={w_med:.3f}, P70={w_p70:.3f}) | Adapt={peso_adapt:.3f} | Efetivo={peso_eff:.3f}")
 
     max_ql = max(x[1] for x in mapped_notes)
     total_bars = int(math.ceil(max_ql / bar_length_ql)) + 1
-    n_sub = 2 if bar_length_ql >= 3.0 else 1
-    reg_len_ql = bar_length_ql / float(n_sub)
+
+    # Regiões harmônicas sincronizadas aos pulsos reais do compasso.
+    if time_sig == "2/4":
+        region_offsets = [0.0, 1.0]
+        region_lengths = [1.0, 1.0]
+    elif time_sig == "3/4":
+        region_offsets = [0.0, 1.0, 2.0]
+        region_lengths = [1.0, 1.0, 1.0]
+    elif time_sig == "4/4":
+        region_offsets = [0.0, 2.0]
+        region_lengths = [2.0, 2.0]
+    elif time_sig == "6/8":
+        region_offsets = [0.0, 1.5]
+        region_lengths = [1.5, 1.5]
+    elif time_sig == "3/2":
+        region_offsets = [0.0, 2.0, 4.0]
+        region_lengths = [2.0, 2.0, 2.0]
+    else:
+        region_offsets = [0.0]
+        region_lengths = [bar_length_ql]
 
     raw_regions = []
     abstention_count = 0
 
     for b_idx in range(total_bars):
         bar_start_ql = b_idx * bar_length_ql
-        for s_i in range(n_sub):
-            r_start_ql = bar_start_ql + s_i * reg_len_ql
-            r_end_ql = r_start_ql + reg_len_ql
+        for s_i, (r_off, r_len) in enumerate(zip(region_offsets, region_lengths)):
+            r_start_ql = bar_start_ql + r_off
+            r_end_ql = r_start_ql + r_len
 
             active = []
             t_starts, t_ends = [], []
@@ -1609,7 +1801,7 @@ def analyze_harmony_root_quality_hmm(
                 abstention_count += 1
                 raw_regions.append({
                     "bar_idx": b_idx,
-                    "offset_in_bar_ql": s_i * reg_len_ql,
+                    "offset_in_bar_ql": r_off,
                     "root_pc": best_root,
                     "root_str": root_str,
                     "root_conf": round(root_conf, 3),
@@ -1644,7 +1836,7 @@ def analyze_harmony_root_quality_hmm(
                 abstention_count += 1
                 raw_regions.append({
                     "bar_idx": b_idx,
-                    "offset_in_bar_ql": s_i * reg_len_ql,
+                    "offset_in_bar_ql": r_off,
                     "root_pc": best_root,
                     "root_str": root_str,
                     "root_conf": round(root_conf, 3),
@@ -1672,7 +1864,7 @@ def analyze_harmony_root_quality_hmm(
 
             raw_regions.append({
                 "bar_idx": b_idx,
-                "offset_in_bar_ql": s_i * reg_len_ql,
+                "offset_in_bar_ql": r_off,
                 "root_pc": best_root,
                 "root_str": root_str,
                 "root_conf": round(root_conf, 3),
@@ -1693,6 +1885,7 @@ def analyze_harmony_root_quality_hmm(
 
     if valid_vocabulary and raw_regions:
         sym_to_xml = {r["mpb_sym"]: r["xml_sym"] for r in raw_regions if r["mpb_sym"] is not None}
+        sym_root_pc = {r["mpb_sym"]: r["root_pc"] for r in raw_regions if r["mpb_sym"] is not None}
         n_v = len(valid_vocabulary)
         stay_p = CONFIG_HARMONY["hmm_stay_prob"]
         change_p = (1.0 - stay_p) / float(max(1, n_v - 1)) if n_v > 1 else 1.0
@@ -1705,7 +1898,7 @@ def analyze_harmony_root_quality_hmm(
             for v_i, sym in enumerate(valid_vocabulary):
                 if reg["mpb_sym"] == sym:
                     em_p = max(0.1, reg["chord_conf"])
-                elif reg["quality"] == "UNKNOWN" and sym.startswith(reg["root_str"]):
+                elif reg["quality"] == "UNKNOWN" and sym_root_pc.get(sym) == reg["root_pc"]:
                     em_p = 0.35 * reg["root_conf"]
                 else:
                     em_p = 0.06
@@ -1728,11 +1921,12 @@ def analyze_harmony_root_quality_hmm(
         path_v.reverse()
 
         prev_chosen = None
+        prev_root_pc = None
         logged_h = 0
         for t, reg in enumerate(raw_regions):
             hmm_sym = valid_vocabulary[path_v[t]]
             if reg["mpb_sym"] is None:
-                if prev_chosen and prev_chosen.startswith(reg["root_str"]):
+                if prev_chosen and prev_root_pc == reg["root_pc"]:
                     chosen_mpb = prev_chosen
                     chosen_xml = sym_to_xml[chosen_mpb]
                     trans_reason = "Mantido acorde anterior (mesma raiz com qualidade local UNKNOWN)"
@@ -1741,14 +1935,25 @@ def analyze_harmony_root_quality_hmm(
                     chosen_xml = None
                     trans_reason = f"ABSTENTION ({reg['reason']})"
             else:
-                chosen_mpb = hmm_sym
-                chosen_xml = sym_to_xml[chosen_mpb]
-                if chosen_mpb != reg["mpb_sym"]:
-                    trans_reason = f"Suavizado por HMM ({reg['mpb_sym']} -> {chosen_mpb})"
-                elif chosen_mpb == prev_chosen:
-                    trans_reason = "Continuidade harmônica"
+                strong_local = (
+                    reg["root_conf"] >= CONFIG_HARMONY["local_override_root_conf"] and
+                    reg["qual_conf"] >= CONFIG_HARMONY["local_override_quality_conf"] and
+                    reg["qual_margin"] >= CONFIG_HARMONY["local_override_margin"] and
+                    reg["chord_conf"] >= CONFIG_HARMONY["local_override_chord_conf"]
+                )
+                if strong_local:
+                    chosen_mpb = reg["mpb_sym"]
+                    chosen_xml = reg["xml_sym"]
+                    trans_reason = "Evidência local forte prevaleceu sobre o HMM"
                 else:
-                    trans_reason = "Nova transição harmônica confirmada"
+                    chosen_mpb = hmm_sym
+                    chosen_xml = sym_to_xml[chosen_mpb]
+                    if chosen_mpb != reg["mpb_sym"]:
+                        trans_reason = f"Suavizado por HMM ({reg['mpb_sym']} -> {chosen_mpb})"
+                    elif chosen_mpb == prev_chosen:
+                        trans_reason = "Continuidade harmônica"
+                    else:
+                        trans_reason = "Nova transição harmônica confirmada"
 
             if logged_h < 14:
                 log.add(
@@ -1761,6 +1966,7 @@ def analyze_harmony_root_quality_hmm(
 
             if chosen_mpb is not None:
                 prev_chosen = chosen_mpb
+                prev_root_pc = sym_root_pc.get(chosen_mpb, reg["root_pc"])
                 chords_by_bar[reg["bar_idx"]].append({
                     "offset_in_bar_ql": reg["offset_in_bar_ql"],
                     "mpb_sym": chosen_mpb,
@@ -1770,8 +1976,11 @@ def analyze_harmony_root_quality_hmm(
 
         for b_k in list(chords_by_bar.keys()):
             c_list = chords_by_bar[b_k]
-            if len(c_list) >= 2 and c_list[0]["mpb_sym"] == c_list[1]["mpb_sym"]:
-                chords_by_bar[b_k] = [c_list[0]]
+            compact = []
+            for item in c_list:
+                if not compact or item["mpb_sym"] != compact[-1]["mpb_sym"]:
+                    compact.append(item)
+            chords_by_bar[b_k] = compact
 
     log.add(f"Regiões avaliadas: {len(raw_regions)} | Abstentions harmônicas: {abstention_count} | Compassos cifrados: {len(chords_by_bar)}")
     return chords_by_bar, abstention_count
@@ -1981,7 +2190,9 @@ if uploaded_file is not None:
                     mid_rms = float(np.sqrt(np.mean(y_mid ** 2)) + 1e-8)
                     side_rms = float(np.sqrt(np.mean(y_side ** 2)) + 1e-8)
                     ms_ratio = mid_rms / side_rms
-                    y_full = (0.65 * y_mid + 0.35 * np.mean(y_raw, axis=0)).astype(np.float32)
+                    # Mix mono preserva todo o conteúdo L/R para ritmo, harmonia e Basic Pitch.
+                    # MID/SIDE é usado apenas para auditoria nesta versão, sem descartar conteúdo lateral.
+                    y_full = np.mean(y_raw[:2], axis=0).astype(np.float32)
                     del y_raw, y_mid, y_side
                 else:
                     orig_channels = 1
@@ -2100,7 +2311,7 @@ if uploaded_file is not None:
                                 if max_allowed_ql >= 0.25 and dur_ql > max_allowed_ql:
                                     dur_ql = max_allowed_ql
 
-                            dur_ql = max(0.25, min(bar_length_ql, dur_ql))
+                            dur_ql = max(0.25, dur_ql)
                             dur_parts = decompose_into_expressible_durations(dur_ql)
                             if len(dur_parts) > 1:
                                 decomposed_count += 1
@@ -2132,8 +2343,9 @@ if uploaded_file is not None:
                         part.makeTies(inPlace=True)
                         corr_pre = auditar_e_sanitizar_duracoes_musicxml(part, log)
 
+                        harmony_key_context = detected_key if key_success else None
                         chords_by_bar, chord_abstentions = analyze_harmony_root_quality_hmm(
-                            dedup_notes, tempo_data["y_harm"], sr, beat_times, pulse_ql, bar_length_ql, detected_key, log
+                            dedup_notes, tempo_data["y_harm"], sr, beat_times, pulse_ql, bar_length_ql, time_sig, harmony_key_context, log
                         )
 
                         del tempo_data
@@ -2232,6 +2444,7 @@ if uploaded_file is not None:
                             f"Compasso: {compasso_exibicao} | Status: {meter_status} | "
                             f"Decision Confidence: {meter_qualities['decision_quality']:.3f} | "
                             f"Bootstrap Stability: {meter_qualities['bootstrap_stability']:.2f} | "
+                            f"Joint Stability: {meter_qualities.get('joint_hypothesis_stability', meter_qualities['bootstrap_stability']):.2f} | "
                             f"Feature Agreement: {meter_qualities['feature_agreement']:.2f}"
                         )
                         log.add(f"Meter Sections: {meter_sections}")
