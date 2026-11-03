@@ -85,7 +85,7 @@ OUTPUT_DIR = Path("temp_outputs")
 for d in [UPLOAD_DIR, OUTPUT_DIR]:
     d.mkdir(exist_ok=True)
 
-APP_VERSION = "A4.3-Dual-Level-Bar-Phrase-Evidence"
+APP_VERSION = "A4.4-Variable-Meter-Global-DP-Harmony-Safe"
 
 # ---------------------------------------------------------
 # 1. SISTEMA DE AUDITORIA E LOG TÉCNICO
@@ -200,6 +200,22 @@ CONFIG_DUAL_BAR = {
     "conflict_margin_penalty": 0.020,
 }
 
+CONFIG_VARIABLE_METER = {
+    # Inferência de mudanças locais sem ensinar ao sistema nomes de músicas.
+    # Critérios conservadores: não criar 5/4 nem mudanças por um único acento.
+    "enabled": True,
+    "states": ("2/4", "3/4", "4/4", "5/4", "6/8"),
+    "window_beats": 28,
+    "hop_beats": 7,
+    "minimum_switch_windows": 3,
+    "minimum_section_beats": 18,
+    "local_advantage": 0.075,
+    "minimum_local_quality": 0.065,
+    "five_four_advantage": 0.22,
+    "five_four_min_beats": 20,
+    "smoothing": 0.20,
+}
+
 CONFIG_CONFIDENCE = {
     "bootstrap_iterations": 48,
     "min_decision_quality": 0.48,
@@ -251,6 +267,10 @@ CONFIG_HARMONY = {
     "local_override_quality_conf": 0.64,
     "local_override_margin": 0.075,
     "local_override_chord_conf": 0.68,
+    "reject_unrelated_hmm_root": True,
+    "root_mismatch_quality_floor": 0.46,
+    "chroma_weight": 0.45,
+    "simplify_ambiguous_extensions": True,
 }
 
 CONFIG_QUANTIZATION = {
@@ -258,7 +278,11 @@ CONFIG_QUANTIZATION = {
     "w_onset_error": 1.0,
     "w_dur_error": 0.85,
     "w_complexity": 0.12,
-    "expressible_single_qls": (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
+    "expressible_single_qls": (1.0/6.0, 0.25, 1.0/3.0, 0.5, 2.0/3.0, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
+    "enable_tuplets": True,
+    "triplet_complexity_penalty": 0.065,
+    "same_grid_transition_penalty": 0.06,
+    "overlap_penalty": 3.0,
 }
 
 
@@ -458,7 +482,11 @@ def detectar_centro_tonal_global(part, y_harm=None, sr=22050, all_notes=None, lo
 
     try:
         key_obj = music21.key.Key(m21_tonic, best_mode)
-        if best_corr < 0.56 or conf < 0.32:
+        if (best_corr < 0.56 or conf < 0.32 or
+                (margin < 0.018 and seg_stability < 0.50)):
+            if log and margin < 0.018:
+                log.add_warning("Tonalidade ambígua: margem/estabilidade insuficientes; "
+                                "nenhum prior tonal imposto aos acordes.")
             return music21.key.Key("C"), False, conf, "Não determinado", "indeterminado"
         return key_obj, True, conf, tonic_pt, mode_pt
     except Exception:
@@ -674,6 +702,217 @@ def seconds_to_musical_position(time_sec: float, beat_times: np.ndarray, pulse_q
     idx_float = float(np.interp(time_sec, beat_times, np.arange(len(beat_times), dtype=float)))
     return max(0.0, idx_float * pulse_ql)
 
+
+# ---------------------------------------------------------
+# 6A. RELÓGIO MUSICAL COM FORMULA DE COMPASSO VARIÁVEL
+# ---------------------------------------------------------
+PULSE_QL = {"2/4": 1.0, "3/4": 1.0, "4/4": 1.0,
+            "5/4": 1.0, "6/8": 1.5, "3/2": 2.0}
+PULSES_PER_BAR = {"2/4": 2, "3/4": 3, "4/4": 4,
+                  "5/4": 5, "6/8": 2, "3/2": 3}
+
+class MetricalTimeline:
+    """Posição musical contínua: nunca confunde segundos, beats e quarterLength.
+
+    Uma troca de compasso é posicionada em uma fronteira da barra anterior.
+    Esse alinhamento também é usado por acordes, quantização e MusicXML.
+    """
+    def __init__(self, beat_times, sections, duration_sec, fallback_sig="4/4"):
+        bt = np.asarray(beat_times, dtype=float)
+        if len(bt) < 2 or np.any(np.diff(bt) <= 0):
+            step = 60.0/120.0
+            bt = np.arange(0.0, max(2.0,float(duration_sec))+step,step)
+        self.beats = bt
+        self.duration_sec = max(float(duration_sec),float(bt[-1]))
+        raw = sorted(sections or [], key=lambda x:float(x.get("start_sec",0.0)))
+        raw = [{"start_sec":0.0,"time_sig":fallback_sig}] + [
+            {"start_sec":float(v["start_sec"]),"time_sig":v["time_sig"]}
+            for v in raw if float(v.get("start_sec",0))>0 and v.get("time_sig") in PULSE_QL]
+        aligned = [{"start_sec":0.0,"start_beat":0,"start_ql":0.0,
+                    "time_sig":raw[0]["time_sig"] if raw[0]["time_sig"] in PULSE_QL else fallback_sig}]
+        for proposed in raw[1:]:
+            prev = aligned[-1]
+            beats_per_bar = PULSES_PER_BAR[prev["time_sig"]]
+            target = int(round(np.interp(proposed["start_sec"], bt, np.arange(len(bt)))))
+            n_bars = int(round((target - prev["start_beat"])/beats_per_bar))
+            at = prev["start_beat"] + n_bars*beats_per_bar
+            if n_bars < 1 or at >= len(bt)-1 or proposed["time_sig"] == prev["time_sig"]:
+                continue
+            ql = prev["start_ql"] + n_bars*beats_per_bar*PULSE_QL[prev["time_sig"]]
+            aligned.append({"start_sec":float(bt[at]),"start_beat":at,
+                            "start_ql":float(ql),"time_sig":proposed["time_sig"]})
+        self.sections = aligned
+        self._starts = np.array([x["start_beat"] for x in aligned],dtype=int)
+        self._qlstarts = np.array([x["start_ql"] for x in aligned],dtype=float)
+
+    def sec_to_ql(self, sec):
+        b = float(np.interp(max(0.0,float(sec)),self.beats,
+                            np.arange(len(self.beats),dtype=float)))
+        k = max(0,int(np.searchsorted(self._starts,b,side="right")-1))
+        v = self.sections[k]
+        return max(0.0,v["start_ql"]+(b-v["start_beat"])*PULSE_QL[v["time_sig"]])
+
+    def ql_to_sec(self, ql):
+        q=max(0.0,float(ql))
+        k=max(0,int(np.searchsorted(self._qlstarts,q,side="right")-1))
+        v=self.sections[k]
+        b=v["start_beat"]+(q-v["start_ql"])/PULSE_QL[v["time_sig"]]
+        return float(np.interp(b,np.arange(len(self.beats),dtype=float),self.beats))
+
+    def bars(self, end_ql=None):
+        end=float(end_ql if end_ql is not None else self.sec_to_ql(self.duration_sec))
+        out=[]
+        for i,sec in enumerate(self.sections):
+            stop=self.sections[i+1]["start_ql"] if i+1<len(self.sections) else end
+            bar_len=PULSES_PER_BAR[sec["time_sig"]]*PULSE_QL[sec["time_sig"]]
+            q=sec["start_ql"]
+            while q < stop-1e-5:
+                nxt=min(stop,q+bar_len)
+                out.append({"bar_idx":len(out),"start_ql":float(q),"end_ql":float(nxt),
+                            "bar_length_ql":float(bar_len),"time_sig":sec["time_sig"]})
+                q=nxt
+                if len(out)>3000:break
+        return out
+
+
+def _safe_sim(x, y):
+    x=np.asarray(x,dtype=float);y=np.asarray(y,dtype=float)
+    return float(np.dot(x,y)/(np.linalg.norm(x)*np.linalg.norm(y)+1e-9))
+
+
+def _meter_bar_score(beat_strength, group):
+    """Escaneia todas as fases; compara formas rítmicas, não BPM por gênero."""
+    x=np.asarray(beat_strength,dtype=float)
+    templates={
+        "2/4": [[1.0,0.30]],
+        "3/4": [[1.0,0.27,0.33]],
+        "4/4": [[1.0,0.28,0.64,0.26]],
+        "5/4": [[1.0,0.27,0.31,0.66,0.26], [1.0,0.27,0.65,0.26,0.30]],
+        "6/8": [[1.0,0.30]],
+        "3/2": [[1.0,0.27,0.32]],
+    }
+    n=PULSES_PER_BAR[group]
+    if len(x)<n*3: return 0.0,0
+    best=(-1.0,0)
+    for template in templates[group]:
+        t=np.asarray(template,dtype=float)
+        for phase in range(n):
+            groups=[]
+            for start in range(phase,len(x)-n+1,n):groups.append(x[start:start+n])
+            if len(groups)<3:continue
+            obs=np.asarray(groups,dtype=float)
+            mean=np.mean(obs,axis=0)
+            shape=_safe_sim(mean-mean.mean(),t-t.mean())
+            # Não premia automaticamente compassos curtos com mais repetições.
+            consistency=float(np.clip(1.0-np.median(np.std(obs,axis=0))/(np.std(x)+1e-5),0,1))
+            sc=0.72*shape+0.28*consistency
+            if sc>best[0]:best=(float(sc),phase)
+    return best
+
+
+def detect_local_meter_sections(onset_norm, beat_times, sr, dedup_notes,
+                                global_sig, log, y_harm=None):
+    """Análise local barata com política de abstinência para mudanças falsas.
+
+    Não usa nomes de músicas, nem lê a partitura de referência. O objetivo é
+    detectar *possíveis* transições persistentes; trecho isolado não basta.
+    """
+    cfg=CONFIG_VARIABLE_METER
+    result=[{"start_sec":0.0,"time_sig":global_sig}]
+    if not cfg["enabled"] or len(beat_times)<cfg["window_beats"]*2:
+        return result
+    hop=CONFIG_SIGNAL["hop_length"]
+    t=np.asarray(beat_times,dtype=float)
+    fr=np.clip(np.round(t*sr/hop).astype(int),0,len(onset_norm)-1)
+    env=np.asarray(onset_norm,dtype=float)
+    on=np.array([float(np.max(env[max(0,f-2):min(len(env),f+3)])) for f in fr])
+    bass=np.zeros(len(t),dtype=float)
+    # Cada ataque de baixo só é lido uma vez; evita O(beats * notas).
+    for note in dedup_notes:
+        if note.pitch>55:continue
+        i=int(np.searchsorted(t,note.start_sec))
+        for j in (i-1,i):
+            if 0<=j<len(t) and abs(t[j]-note.start_sec)<0.17:
+                bass[j]=max(bass[j],note.velocity/127.0)
+    # Chroma local opcional em blocos: evita espectrograma de 8 minutos
+    # inteiro na RAM de uma instância gratuita do Render.
+    harmonic=np.zeros(len(t),dtype=float)
+    if y_harm is not None and len(y_harm)>sr:
+        try:
+            c_beats=np.zeros((12,len(t)),dtype=np.float32)
+            block=96 # beats por bloco; apenas ~1 minuto na RAM
+            for a_idx in range(0,len(t),block):
+                b_idx=min(len(t),a_idx+block)
+                sec0=max(0.0,float(t[a_idx])-0.8)
+                sec1=min(len(y_harm)/sr,float(t[b_idx-1])+1.0)
+                wave=np.asarray(y_harm[int(sec0*sr):int(sec1*sr)],dtype=np.float32)
+                if len(wave)<2048:continue
+                if sr!=11025:
+                    wave=librosa.resample(wave,orig_sr=sr,target_sr=11025)
+                cblock=librosa.feature.chroma_stft(y=wave,sr=11025,
+                                                    n_fft=1024,hop_length=1024)
+                where=np.clip(np.round((t[a_idx:b_idx]-sec0)*11025/1024).astype(int),
+                              0,cblock.shape[1]-1)
+                c_beats[:,a_idx:b_idx]=cblock[:,where]
+            c_beats=c_beats/(np.linalg.norm(c_beats,axis=0,keepdims=True)+1e-8)
+            harmonic[1:]=np.clip(np.sqrt(np.sum(np.diff(c_beats,axis=1)**2,axis=0))/1.5,0,1)
+        except (ValueError,MemoryError,RuntimeError):
+            pass
+    def normalize(v):
+        v=np.asarray(v,dtype=float)
+        return np.clip((v-np.percentile(v,10))/(np.percentile(v,90)-np.percentile(v,10)+1e-6),0,1)
+    strength=0.54*normalize(on)+0.22*normalize(bass)+0.24*normalize(harmonic)
+    win=int(cfg["window_beats"]);step=int(cfg["hop_beats"])
+    windows=[]
+    for i in range(0,len(t)-win+1,step):
+        vals=strength[i:i+win]
+        if float(np.std(vals))<0.045:continue
+        scores={}
+        local_states=list(cfg["states"])
+        if global_sig not in local_states:local_states.append(global_sig)
+        for ts in local_states:
+            sc,_=_meter_bar_score(vals,ts)
+            if ts=="5/4":sc-=0.14 # conservador em metros irregulares
+            elif ts=="6/8":sc-=0.10 # subdivisão ternária exige prova extra
+            scores[ts]=sc
+        ranked=sorted(scores.items(),key=lambda kv:kv[1],reverse=True)
+        top,topsc=ranked[0]
+        base=scores.get(global_sig,0.0)
+        advantage=topsc-base
+        quality=max(0.0,topsc-max(v for k,v in scores.items() if k!=top))
+        # 2/4 x 4/4 em two-feel é ambíguo no áudio: NÃO trocar barras só
+        # porque o padrão de acentos local parece binário. Exigir evidência
+        # excepcionalmente alta e persistente antes de assumir transição.
+        binary_pair={top,global_sig}=={"2/4","4/4"}
+        binary_ok=(not binary_pair or (quality>=0.32 and advantage>=0.34))
+        good=(top!=global_sig and quality>=cfg["minimum_local_quality"] and
+              advantage>=cfg["local_advantage"] and binary_ok and
+              (top!="5/4" or (win>=cfg["five_four_min_beats"] and
+                                   advantage>=cfg["five_four_advantage"])))
+        windows.append({"start_beat":i,"mid_beat":i+win//2,
+                        "pred":top if good else global_sig,
+                        "winner":top,"margin":round(quality,3),
+                        "advantage":round(advantage,3)})
+    # Exige persistência de 3 janelas e 18 beats antes de criar mudança.
+    active=global_sig; changes=[]
+    need=int(cfg["minimum_switch_windows"])
+    for j in range(need-1,len(windows)):
+        last=windows[j-need+1:j+1]
+        kinds={v["pred"] for v in last}
+        if len(kinds)!=1:continue
+        candidate=last[-1]["pred"]
+        if candidate==active:continue
+        at=last[0]["mid_beat"]
+        if changes and at-changes[-1][0] < cfg["minimum_section_beats"]:continue
+        if at<cfg["minimum_section_beats"]:continue
+        changes.append((at,candidate));active=candidate
+    for at,ts in changes:
+        result.append({"start_sec":float(t[min(at,len(t)-1)]),"time_sig":ts})
+    log.add("\n==============================\nA4.4 VARIABLE METER AUDIT\n==============================")
+    log.add(f"Janela local: {win} beats, passo {step}; válidas={len(windows)}; "
+            f"candidatas a mudanças={len(changes)}; confirmadas={result}")
+    for row in windows[:8]:log.add(f"  LOCAL METER WINDOW {row}")
+    return result
 
 # ---------------------------------------------------------
 # 7. MOTOR DE COMPASSO HIERÁRQUICO, VITERBI E BOOTSTRAP
@@ -2086,7 +2325,8 @@ CHORD_QUALITY_SPECS = [
 ]
 
 def analyze_harmony_root_quality_hmm(
-    dedup_notes, y_harm, sr, beat_times, pulse_ql, bar_length_ql, time_sig, detected_key, log: TechnicalLogger
+    dedup_notes, y_harm, sr, beat_times, pulse_ql, bar_length_ql,
+    time_sig, detected_key, log: TechnicalLogger, timeline=None
 ):
     log.add("\n==============================\nHARMONY ENGINE (ROOT -> QUALITY -> HMM SMOOTHING)\n==============================")
     if not dedup_notes or len(beat_times) < 2:
@@ -2118,8 +2358,10 @@ def analyze_harmony_root_quality_hmm(
 
     mapped_notes = []
     for n in harm_notes:
-        s_ql = seconds_to_musical_position(n.start_sec, beat_times, pulse_ql=pulse_ql)
-        e_ql = seconds_to_musical_position(n.end_sec, beat_times, pulse_ql=pulse_ql)
+        position = timeline.sec_to_ql if timeline is not None else \
+            lambda sec:seconds_to_musical_position(sec, beat_times, pulse_ql=pulse_ql)
+        s_ql = position(n.start_sec)
+        e_ql = position(n.end_sec)
         d_ql = max(0.25, e_ql - s_ql)
         w_val = d_ql * (n.velocity / 127.0)
         mapped_notes.append((s_ql, e_ql, d_ql, n.pitch, w_val, n.start_sec, n.end_sec))
@@ -2132,36 +2374,34 @@ def analyze_harmony_root_quality_hmm(
     log.add(f"PESO ACORDE (QL)  -> Base={peso_base:.3f} | Medido(Med={w_med:.3f}, P70={w_p70:.3f}) | Adapt={peso_adapt:.3f} | Efetivo={peso_eff:.3f}")
 
     max_ql = max(x[1] for x in mapped_notes)
-    total_bars = int(math.ceil(max_ql / bar_length_ql)) + 1
-
-    # Regiões harmônicas sincronizadas aos pulsos reais do compasso.
-    if time_sig == "2/4":
-        region_offsets = [0.0, 1.0]
-        region_lengths = [1.0, 1.0]
-    elif time_sig == "3/4":
-        region_offsets = [0.0, 1.0, 2.0]
-        region_lengths = [1.0, 1.0, 1.0]
-    elif time_sig == "4/4":
-        region_offsets = [0.0, 2.0]
-        region_lengths = [2.0, 2.0]
-    elif time_sig == "6/8":
-        region_offsets = [0.0, 1.5]
-        region_lengths = [1.5, 1.5]
-    elif time_sig == "3/2":
-        region_offsets = [0.0, 2.0, 4.0]
-        region_lengths = [2.0, 2.0, 2.0]
+    if timeline is not None:
+        bar_specs=timeline.bars(max_ql+1.0/6.0)
     else:
-        region_offsets = [0.0]
-        region_lengths = [bar_length_ql]
+        length=max(float(bar_length_ql),1.0)
+        bar_specs=[{"bar_idx":i,"start_ql":i*length,"end_ql":(i+1)*length,
+                    "bar_length_ql":length,"time_sig":time_sig}
+                    for i in range(int(math.ceil(max_ql/length))+1)]
+
+    def regions_for_bar(spec):
+        ts=spec["time_sig"]
+        if ts=="2/4":return [(0.0,1.0),(1.0,1.0)]
+        if ts=="3/4":return [(0.0,1.0),(1.0,1.0),(2.0,1.0)]
+        if ts=="4/4":return [(0.0,2.0),(2.0,2.0)]
+        if ts=="5/4":return [(0.0,2.0),(2.0,2.0),(4.0,1.0)]
+        if ts=="6/8":return [(0.0,1.5),(1.5,1.5)]
+        if ts=="3/2":return [(0.0,2.0),(2.0,2.0),(4.0,2.0)]
+        return [(0.0,spec["bar_length_ql"])]
 
     raw_regions = []
     abstention_count = 0
 
-    for b_idx in range(total_bars):
-        bar_start_ql = b_idx * bar_length_ql
-        for s_i, (r_off, r_len) in enumerate(zip(region_offsets, region_lengths)):
+    for spec in bar_specs:
+        b_idx=int(spec["bar_idx"])
+        bar_start_ql=float(spec["start_ql"])
+        for s_i, (r_off, r_len) in enumerate(regions_for_bar(spec)):
             r_start_ql = bar_start_ql + r_off
-            r_end_ql = r_start_ql + r_len
+            r_end_ql = min(float(spec["end_ql"]),r_start_ql + r_len)
+            if r_end_ql-r_start_ql < 0.14:continue
 
             active = []
             t_starts, t_ends = [], []
@@ -2194,14 +2434,24 @@ def analyze_harmony_root_quality_hmm(
 
             pc_chroma = np.zeros(12, dtype=float)
             if chroma_full is not None and t_starts:
-                f0 = max(0, int(round(min(t_starts) * sr / hop)))
-                f1 = min(chroma_full.shape[1], int(round(max(t_ends) * sr / hop)) + 1)
+                # Janela harmônica real da região, não o min/max das notas que
+                # podem atravessar acordes vizinhos.
+                if timeline is not None:
+                    sec0=timeline.ql_to_sec(r_start_ql)
+                    sec1=timeline.ql_to_sec(r_end_ql)
+                else:
+                    sec0=min(t_starts);sec1=max(t_ends)
+                f0 = max(0, int(round(sec0 * sr / hop)))
+                f1 = min(chroma_full.shape[1], int(round(sec1 * sr / hop)) + 1)
                 if f1 > f0:
                     c_slice = np.mean(chroma_full[:, f0:f1], axis=1)
                     if np.max(c_slice) > 0:
                         pc_chroma = c_slice / np.max(c_slice)
 
-            pc_comb = 0.62 * pc_notes + 0.38 * pc_chroma
+            # O espectro é fundamental quando Basic Pitch extrai só a melodia,
+            # mas não deve dominar quando está ausente.
+            w_chroma=CONFIG_HARMONY["chroma_weight"] if np.max(pc_chroma)>0 else 0.0
+            pc_comb = (1.0-w_chroma)*pc_notes + w_chroma*pc_chroma
             if np.max(pc_comb) <= 1e-6:
                 continue
             pc_comb = pc_comb / np.max(pc_comb)
@@ -2271,6 +2521,20 @@ def analyze_harmony_root_quality_hmm(
             q_sc1, q_name1, mpb_s1, xml_s1 = qual_cands[0]
             q_sc2, q_name2, _, _ = qual_cands[1]
             q_margin = q_sc1 - q_sc2
+            if (CONFIG_HARMONY["simplify_ambiguous_extensions"] and
+                    0 <= q_margin < CONFIG_HARMONY["quality_min_margin"]):
+                groups={"maj":"maj","add9":"maj",
+                        "min":"min","m7":"min","m9":"min",
+                        "7":"7","9":"7","7_13":"7",
+                        "sus4":"sus4","7sus4":"sus4"}
+                same_family=(groups.get(q_name1)==groups.get(q_name2) and
+                             groups.get(q_name1) is not None)
+                if same_family and q_sc1>=0.45:
+                    simplified=groups[q_name1]
+                    suf={"maj":("",""),"min":("m","m"),
+                         "7":("7","7"),"sus4":("4","sus4")}
+                    q_name1=simplified;mpb_s1,xml_s1=suf[simplified]
+                    q_margin=CONFIG_HARMONY["quality_min_margin"]+0.005
             qual_conf = float(np.clip(0.60 * q_sc1 + 0.40 * min(1.0, q_margin * 4.0), 0.0, 1.0))
             chord_conf = float(np.sqrt(root_conf * qual_conf))
 
@@ -2336,26 +2600,32 @@ def analyze_harmony_root_quality_hmm(
         dp_h = np.zeros((n_reg, n_v), dtype=float)
         back_h = np.zeros((n_reg, n_v), dtype=int)
 
+        # Transições uniformes entre acordes: otimização O(n_regions * n_vocab),
+        # em vez do antigo O(n_regions * n_vocab²).
+        root_ids=np.array([sym_root_pc[sym] for sym in valid_vocabulary],dtype=int)
+        vocab_pos={sym:i for i,sym in enumerate(valid_vocabulary)}
+        log_stay=math.log(max(1e-8,stay_p))
+        log_change=math.log(max(1e-8,change_p))
         for t, reg in enumerate(raw_regions):
-            for v_i, sym in enumerate(valid_vocabulary):
-                if reg["mpb_sym"] == sym:
-                    em_p = max(0.1, reg["chord_conf"])
-                elif reg["quality"] == "UNKNOWN" and sym_root_pc.get(sym) == reg["root_pc"]:
-                    em_p = 0.35 * reg["root_conf"]
-                else:
-                    em_p = 0.06
-
-                log_em = math.log(em_p + 1e-9)
-                if t == 0:
-                    dp_h[0, v_i] = log_em
-                else:
-                    prev_list = [
-                        dp_h[t - 1, p_i] + math.log(stay_p if p_i == v_i else change_p) + log_em
-                        for p_i in range(n_v)
-                    ]
-                    best_p = int(np.argmax(prev_list))
-                    dp_h[t, v_i] = prev_list[best_p]
-                    back_h[t, v_i] = best_p
+            log_em=np.full(n_v, math.log(0.025),dtype=float)
+            if reg["mpb_sym"] in vocab_pos:
+                log_em[vocab_pos[reg["mpb_sym"]]]=math.log(max(0.08,reg["chord_conf"]))
+            if reg["quality"] == "UNKNOWN":
+                matching=np.where(root_ids==reg["root_pc"])[0]
+                log_em[matching]=math.log(max(0.03,0.20*reg["root_conf"]))
+            if t==0:
+                dp_h[0]=log_em
+                continue
+            prev=dp_h[t-1]
+            largest=int(np.argmax(prev))
+            runner=int(np.argmax(np.where(np.arange(n_v)==largest,-np.inf,prev))) if n_v>1 else largest
+            other=np.full(n_v,largest,dtype=int)
+            other[largest]=runner
+            stay_val=prev+log_stay
+            change_val=prev[other]+log_change
+            is_stay=stay_val>=change_val
+            back_h[t]=np.where(is_stay,np.arange(n_v),other)
+            dp_h[t]=np.maximum(stay_val,change_val)+log_em
 
         path_v = [int(np.argmax(dp_h[-1]))]
         for t in range(n_reg - 1, 0, -1):
@@ -2388,9 +2658,27 @@ def analyze_harmony_root_quality_hmm(
                     chosen_xml = reg["xml_sym"]
                     trans_reason = "Evidência local forte prevaleceu sobre o HMM"
                 else:
-                    chosen_mpb = hmm_sym
-                    chosen_xml = sym_to_xml[chosen_mpb]
-                    if chosen_mpb != reg["mpb_sym"]:
+                    # Um estado HMM pertencente a outra raiz só pode prevalecer
+                    # com evidência de raiz fraca. Em acordes jazzísticos não
+                    # apagar raiz detectada só para manter acorde anterior.
+                    root_conflict = (CONFIG_HARMONY["reject_unrelated_hmm_root"] and
+                                     sym_root_pc.get(hmm_sym)!=reg["root_pc"])
+                    if root_conflict and reg["root_conf"]>=0.68:
+                        if (reg["qual_conf"]>=CONFIG_HARMONY["root_mismatch_quality_floor"] and
+                                reg["qual_margin"]>=CONFIG_HARMONY["quality_min_margin"]):
+                            chosen_mpb=reg["mpb_sym"]
+                            chosen_xml=reg["xml_sym"]
+                            trans_reason="Raiz local protegida do HMM"
+                        else:
+                            chosen_mpb=None
+                            chosen_xml=None
+                            trans_reason="ABSTENTION (HMM conflita com raiz local)"
+                    else:
+                        chosen_mpb = hmm_sym
+                        chosen_xml = sym_to_xml[chosen_mpb]
+                    if chosen_mpb is None:
+                        pass
+                    elif chosen_mpb != reg["mpb_sym"]:
                         trans_reason = f"Suavizado por HMM ({reg['mpb_sym']} -> {chosen_mpb})"
                     elif chosen_mpb == prev_chosen:
                         trans_reason = "Continuidade harmônica"
@@ -2425,118 +2713,140 @@ def analyze_harmony_root_quality_hmm(
             chords_by_bar[b_k] = compact
 
     log.add(f"Regiões avaliadas: {len(raw_regions)} | Abstentions harmônicas: {abstention_count} | Compassos cifrados: {len(chords_by_bar)}")
+    log.add(f"HARMONY AUDIT: regiões/compasso variável={len(bar_specs)}; "
+            f"sem raiz/qualidade confirmada={abstention_count}; "
+            f"acordes candidatos no vocabulário={len(valid_vocabulary)}")
     return chords_by_bar, abstention_count
 
 
 # ---------------------------------------------------------
 # 11. QUANTIZAÇÃO GLOBAL ÓTIMA E DECOMPOSIÇÃO DE DURAÇÕES
 # ---------------------------------------------------------
+def _duration_approx(q, allowed=None):
+    allowed = allowed or CONFIG_QUANTIZATION["expressible_single_qls"]
+    q=max(1.0/6.0,float(q))
+    return min(allowed,key=lambda d:abs(d-q))
+
+
 def decompose_into_expressible_durations(dur_ql: float) -> list:
-    q = round(float(dur_ql) * 4.0) / 4.0
-    if q <= 0.0:
-        return [0.25]
-    expressible = set(CONFIG_QUANTIZATION["expressible_single_qls"])
-    if q in expressible:
-        return [q]
+    """Decompõe em figuras musicais válidas, preservando durações ternárias."""
+    q=max(1.0/6.0,float(dur_ql))
+    allowed=sorted(CONFIG_QUANTIZATION["expressible_single_qls"],reverse=True)
+    for v in allowed:
+        if abs(q-v)<2e-4:return [float(v)]
+    # Busca em grade 1/12 de QL: 1/6 e 1/3 continuam expressáveis.
+    cents=int(round(q*12))
+    denom=[int(round(d*12)) for d in allowed]
+    dp=[None]*(cents+1)
+    dp[0]=[]
+    for k in range(1,cents+1):
+        for v,t in zip(allowed,denom):
+            if t<=k and dp[k-t] is not None:
+                prop=dp[k-t]+[v]
+                if dp[k] is None or len(prop)<len(dp[k]):dp[k]=prop
+    if dp[cents] is not None and len(dp[cents])<=12:
+        return [float(x) for x in dp[cents]]
+    return [float(_duration_approx(q))]
 
-    parts = []
-    rem = q
-    ordered_valid = sorted(list(expressible), reverse=True)
-    while rem > 1e-4:
-        picked = 0.25
-        for v in ordered_valid:
-            if v <= rem + 1e-4:
-                picked = v
-                break
-        parts.append(round(picked * 4.0) / 4.0)
-        rem = round((rem - picked) * 4.0) / 4.0
-    return parts if parts else [0.25]
+
+def _quant_candidates(raw_start, raw_dur):
+    cfg=CONFIG_QUANTIZATION
+    grids=[(0.25,"binary")]
+    if cfg.get("enable_tuplets",True):grids.append((1.0/3.0,"triplet"))
+    allowed=tuple(cfg["expressible_single_qls"])
+    out=[]
+    for spacing,kind in grids:
+        anchor=int(round(raw_start/spacing))
+        for off in (-1,0,1):
+            start=max(0.0,(anchor+off)*spacing)
+            # Perto do final da nota, considerar as duas durações próximas
+            ds=sorted(allowed,key=lambda x:abs(x-raw_dur))[:4]
+            for dur in ds:
+                if dur>max(raw_dur*2.6,0.75) and raw_dur<1.0:continue
+                onset_error=abs(start-raw_start)
+                dur_error=abs(dur-raw_dur)
+                penalty=cfg["triplet_complexity_penalty"] if kind=="triplet" else 0.0
+                # Tercina só vence quando aproxima mais do áudio.
+                intrinsic=(cfg["w_onset_error"]*onset_error+
+                           cfg["w_dur_error"]*dur_error+
+                           cfg["w_complexity"]*0.10*(1 if dur>=3 else 0)+penalty)
+                out.append((round(start,8),round(start+dur,8),kind,intrinsic))
+    out.sort(key=lambda x:x[3])
+    unique=[];keys=set()
+    for c in out:
+        key=(c[0],c[1])
+        if key not in keys:unique.append(c);keys.add(key)
+        if len(unique)>=10:break
+    return unique
 
 
-def quantize_melody_dp_global(melody_notes, beat_times, pulse_ql, bar_length_ql, log: TechnicalLogger):
-    sub_ql = CONFIG_QUANTIZATION["grid_subdivision_ql"]
-    w_on = CONFIG_QUANTIZATION["w_onset_error"]
-    w_dur = CONFIG_QUANTIZATION["w_dur_error"]
-    w_cx = CONFIG_QUANTIZATION["w_complexity"]
-    expressible = set(CONFIG_QUANTIZATION["expressible_single_qls"])
+def quantize_melody_dp_global(melody_notes, beat_times, pulse_ql,
+                              bar_length_ql, log: TechnicalLogger, timeline=None):
+    """DP/Viterbi verdadeiro de onsets/durações, com grades binária e ternária.
 
-    quantized_events = []
-    onset_errors = []
-    altered_events = 0
-
-    for n in melody_notes:
-        raw_s = seconds_to_musical_position(n.start_sec, beat_times, pulse_ql=pulse_ql)
-        raw_e = seconds_to_musical_position(n.end_sec, beat_times, pulse_ql=pulse_ql)
-        raw_d = max(sub_ql, raw_e - raw_s)
-
-        s_floor = math.floor(raw_s / sub_ql) * sub_ql
-        s_cands = [round(s_floor * 4.0) / 4.0, round((s_floor + sub_ql) * 4.0) / 4.0]
-
-        best_cost = 1e9
-        best_s = s_cands[0]
-        best_e = best_s + sub_ql
-
-        for sc in s_cands:
-            d_floor = max(sub_ql, math.floor(raw_d / sub_ql) * sub_ql)
-            d_cands = [round(d_floor * 4.0) / 4.0, round((d_floor + sub_ql) * 4.0) / 4.0]
-            for dc in d_cands:
-                ec = round((sc + dc) * 4.0) / 4.0
-                on_err = abs(sc - raw_s)
-                dur_err = abs(dc - raw_d)
-                cx_pen = (0.0 if (sc * 2.0).is_integer() else 0.35) + (0.0 if dc in expressible else 0.45)
-                cost = w_on * on_err + w_dur * dur_err + w_cx * cx_pen
-                if cost < best_cost:
-                    best_cost = cost
-                    best_s = sc
-                    best_e = ec
-
-        err_val = abs(best_s - raw_s)
-        onset_errors.append(err_val)
-        if err_val > 0.06:
-            altered_events += 1
-
-        quantized_events.append({
-            "start_ql": best_s,
-            "end_ql": best_e,
-            "pitch": int(n.pitch),
-            "velocity": int(n.velocity),
-            "start_sec": n.start_sec,
-            "end_sec": n.end_sec,
-        })
-
-    quantized_events.sort(key=lambda x: (x["start_ql"], -x["velocity"]))
-    clean_events = []
-    for ev in quantized_events:
-        if not clean_events:
-            clean_events.append(ev)
-        else:
-            prev = clean_events[-1]
-            if abs(ev["start_ql"] - prev["start_ql"]) < 1e-4:
-                continue
-            if prev["end_ql"] > ev["start_ql"]:
-                prev["end_ql"] = max(prev["start_ql"] + sub_ql, ev["start_ql"])
-            clean_events.append(ev)
-
-    if onset_errors:
-        arr_e = np.array(onset_errors, dtype=float)
-        e_mean = float(np.mean(arr_e))
-        e_p50 = float(np.percentile(arr_e, 50))
-        e_p75 = float(np.percentile(arr_e, 75))
-        e_p90 = float(np.percentile(arr_e, 90))
-        e_p95 = float(np.percentile(arr_e, 95))
-        e_max = float(np.max(arr_e))
-    else:
-        e_mean, e_p50, e_p75, e_p90, e_p95, e_max = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-
-    log.add("\n==============================\nGLOBAL DP QUANTIZATION AUDIT\n==============================")
-    log.add(f"Eventos quantizados: {len(clean_events)} | Eventos alterados (>0.06 QL): {altered_events}")
-    log.add(
-        f"Erro de Onset (QL) -> Médio={e_mean:.4f} | P50={e_p50:.4f} | P75={e_p75:.4f} | "
-        f"P90={e_p90:.4f} | P95={e_p95:.4f} | Máx={e_max:.4f}"
-    )
-
-    return clean_events, {"p50": round(e_p50, 4), "p90": round(e_p90, 4), "p95": round(e_p95, 4)}
-
+    Estados por evento, transição penaliza sobreposição e alternância gratuita
+    de grid; não inventa notas nem força semínimas nas tercinas.
+    """
+    convert=(timeline.sec_to_ql if timeline is not None else
+             lambda sec:seconds_to_musical_position(sec,beat_times,pulse_ql))
+    seq=sorted(melody_notes,key=lambda n:(n.start_sec,-n.velocity))
+    if not seq:
+        return [],{"p50":0,"p90":0,"p95":0}
+    raw=[(convert(n.start_sec),convert(n.end_sec)) for n in seq]
+    states=[_quant_candidates(a,max(1/6,b-a)) for a,b in raw]
+    costs=[np.array([c[3] for c in states[0]],dtype=float)]
+    backs=[]
+    cfg=CONFIG_QUANTIZATION
+    for i in range(1,len(seq)):
+        now=states[i];before=states[i-1]
+        local=np.empty(len(now),dtype=float);ptr=np.zeros(len(now),dtype=np.int32)
+        for j,(st,en,grid,base) in enumerate(now):
+            prev=np.array([
+                costs[-1][k]+
+                cfg["overlap_penalty"]*max(0.0,pen-st)**2+
+                (cfg["same_grid_transition_penalty"]
+                 if pgrid!=grid and st-pst<1.5 else 0.0)
+                for k,(pst,pen,pgrid,_) in enumerate(before)])
+            choice=int(np.argmin(prev));ptr[j]=choice
+            local[j]=float(base)+float(prev[choice])
+        costs.append(local);backs.append(ptr)
+    path=[int(np.argmin(costs[-1]))]
+    for t in range(len(seq)-2,-1,-1):path.append(int(backs[t][path[-1]]))
+    path.reverse()
+    selected=[]
+    for n,idx,opts in zip(seq,path,states):
+        a,b,grid,sc=opts[idx]
+        selected.append({"start_ql":a,"end_ql":b,"pitch":int(n.pitch),
+                         "velocity":int(n.velocity),"grid":grid,
+                         "start_sec":float(n.start_sec),"end_sec":float(n.end_sec)})
+    # Resolver ataques duplicados e pequenos overlaps, usando durações expressáveis.
+    clean=[];removed=0
+    for ev in selected:
+        if clean and abs(ev["start_ql"]-clean[-1]["start_ql"])<1e-5:
+            if ev["velocity"]>clean[-1]["velocity"]:clean[-1]=ev
+            removed+=1;continue
+        if clean and clean[-1]["end_ql"]>ev["start_ql"]+1e-6:
+            available=ev["start_ql"]-clean[-1]["start_ql"]
+            legal=[v for v in cfg["expressible_single_qls"] if v<=available+1e-5]
+            if legal:
+                chosen=max(legal)
+                clean[-1]["end_ql"]=clean[-1]["start_ql"]+chosen
+            else:
+                # Dois ataques inviáveis: preservar o mais forte, sem nota inventada.
+                if ev["velocity"]<=clean[-1]["velocity"]:
+                    removed+=1;continue
+                clean.pop();removed+=1
+        clean.append(ev)
+    err=np.array([abs(ev["start_ql"]-convert(ev["start_sec"])) for ev in clean],dtype=float)
+    q=lambda pct:round(float(np.percentile(err,pct)),4) if len(err) else 0.0
+    triples=sum(1 for ev in clean if ev["grid"]=="triplet")
+    log.add("\n==============================\nA4.4 GLOBAL DP + TUPLET GRID AUDIT\n==============================")
+    log.add(f"Eventos finais={len(clean)}; removidos por colisão={removed}; "
+            f"grid triplet={triples}; grid binário={len(clean)-triples}")
+    log.add(f"Erros Onset QL: P50={q(50)} P90={q(90)} P95={q(95)}; "
+            f"alterados >0.06QL={int(np.sum(err>0.06))}")
+    return clean,{"p50":q(50),"p90":q(90),"p95":q(95),
+                  "triplet_events":triples,"rejected_collisions":removed}
 
 def auditar_e_sanitizar_duracoes_musicxml(stream_obj, log: TechnicalLogger):
     corrigidos = 0
@@ -2548,7 +2858,7 @@ def auditar_e_sanitizar_duracoes_musicxml(stream_obj, log: TechnicalLogger):
             ql = float(el.quarterLength)
             dtype = getattr(el.duration, "type", "")
             if ql <= 0.0 or dtype in ("inexpressible", "zero"):
-                novo_ql = round(ql * 4.0) / 4.0
+                novo_ql = _duration_approx(ql)
                 if novo_ql <= 0.0:
                     novo_ql = 0.25
                 if abs(novo_ql - ql) > 1e-5 or dtype == "inexpressible":
@@ -2575,7 +2885,7 @@ with st.sidebar:
     st.markdown("### ⚙️ Configurações de Métrica")
     compasso_selecionado = st.selectbox(
         "Fórmula de Compasso:",
-        ["Automático", "2/4", "3/4", "4/4", "6/8", "3/2"],
+        ["Automático", "2/4", "3/4", "4/4", "5/4", "6/8", "3/2"],
         index=0,
         help="No modo Automático, o sistema executa inferência hierárquica probabilística. Se conhecer a métrica exata da obra, selecione manualmente."
     )
@@ -2609,6 +2919,7 @@ if uploaded_file is not None:
         log.add(f"CONFIG_TACTUS: {CONFIG_TACTUS}")
         log.add(f"CONFIG_METER: {CONFIG_METER}")
         log.add(f"CONFIG_DUAL_BAR: {CONFIG_DUAL_BAR}")
+        log.add(f"CONFIG_VARIABLE_METER: {CONFIG_VARIABLE_METER}")
         log.add(f"CONFIG_CONFIDENCE: {CONFIG_CONFIDENCE}")
         log.add(f"CONFIG_MELODY: {CONFIG_MELODY}")
         log.add(f"CONFIG_HARMONY: {CONFIG_HARMONY}")
@@ -2664,7 +2975,7 @@ if uploaded_file is not None:
                         compasso_exibicao = f"{time_sig} (Manual)"
                         meter_status = "manual"
                         meter_conf_str = "manual"
-                        pulse_ql = {"2/4": 1.0, "3/4": 1.0, "4/4": 1.0, "6/8": 1.5, "3/2": 2.0}.get(time_sig, 1.0)
+                        pulse_ql = PULSE_QL.get(time_sig, 1.0)
                         meter_sections = [{"start_sec": 0.0, "time_sig": time_sig}]
                         meter_qualities = {
                             "signal_quality": round(tempo_data["signal_quality"], 3),
@@ -2696,6 +3007,23 @@ if uploaded_file is not None:
                     )
                     meter_qualities["beat_quality"] = round(beat_quality, 3)
 
+                    # No automático, a detecção local pode acrescentar mudanças
+                    # apenas quando há evidência independente e persistente.
+                    if compasso_selecionado == "Automático" and meter_status == "detected":
+                        meter_sections = detect_local_meter_sections(
+                            tempo_data["onset_norm"], beat_times, sr, dedup_notes,
+                            time_sig, log, y_harm=tempo_data["y_harm"])
+                    timeline = MetricalTimeline(beat_times, meter_sections,
+                                                total_duration, fallback_sig=time_sig)
+                    meter_sections = [{"start_sec":v["start_sec"],
+                                       "time_sig":v["time_sig"],
+                                       "start_ql":v["start_ql"]}
+                                      for v in timeline.sections]
+                    if len(meter_sections)>1:
+                        seq_sig=" → ".join(v["time_sig"] for v in meter_sections)
+                        compasso_exibicao=f"Variável ({seq_sig}) — alterações locais sugeridas"
+                    log.add(f"METER TIMELINE ALIGNED: {meter_sections}")
+
                     num, den = map(int, time_sig.split("/"))
                     bar_length_ql = float(num) * (4.0 / float(den))
 
@@ -2721,7 +3049,8 @@ if uploaded_file is not None:
                         midi_status = "OK"
 
                         quant_events, quant_err_stats = quantize_melody_dp_global(
-                            melody_notes, beat_times, pulse_ql, bar_length_ql, log
+                            melody_notes, beat_times, pulse_ql, bar_length_ql, log,
+                            timeline=timeline
                         )
 
                         score = music21.stream.Score()
@@ -2733,28 +3062,27 @@ if uploaded_file is not None:
                         part.insert(0, music21.clef.TrebleClef())
                         part.insert(0, music21.tempo.MetronomeMark(number=bpm))
 
-                        if len(meter_sections) > 1 and meter_status == "detected":
-                            for sec_m in meter_sections:
-                                sec_ql = round(seconds_to_musical_position(sec_m["start_sec"], beat_times, pulse_ql=pulse_ql) / bar_length_ql) * bar_length_ql
-                                part.insert(float(max(0.0, sec_ql)), music21.meter.TimeSignature(sec_m["time_sig"]))
-                        else:
-                            part.insert(0, music21.meter.TimeSignature(time_sig))
+                        for sec_m in timeline.sections:
+                            part.insert(float(sec_m["start_ql"]),
+                                        music21.meter.TimeSignature(sec_m["time_sig"]))
 
                         decomposed_count = 0
                         ties_created = 0
 
                         for idx, ev in enumerate(quant_events):
                             start_ql = ev["start_ql"]
-                            dur_ql = round((ev["end_ql"] - start_ql) * 4.0) / 4.0
+                            dur_ql = float(ev["end_ql"] - start_ql)
                             if dur_ql <= 0.0:
-                                dur_ql = 0.25
+                                dur_ql = 1.0/6.0
 
                             if idx + 1 < len(quant_events):
-                                max_allowed_ql = round((quant_events[idx + 1]["start_ql"] - start_ql) * 4.0) / 4.0
-                                if max_allowed_ql >= 0.25 and dur_ql > max_allowed_ql:
-                                    dur_ql = max_allowed_ql
+                                max_allowed_ql = float(quant_events[idx + 1]["start_ql"] - start_ql)
+                                if max_allowed_ql >= 1.0/6.0 and dur_ql > max_allowed_ql:
+                                    allowed=[d for d in CONFIG_QUANTIZATION["expressible_single_qls"]
+                                             if d <= max_allowed_ql+1e-5]
+                                    if allowed:dur_ql = max(allowed)
 
-                            dur_ql = max(0.25, dur_ql)
+                            dur_ql = max(1.0/6.0, dur_ql)
                             dur_parts = decompose_into_expressible_durations(dur_ql)
                             if len(dur_parts) > 1:
                                 decomposed_count += 1
@@ -2773,7 +3101,7 @@ if uploaded_file is not None:
                                         el.tie = music21.tie.Tie("continue")
                                         ties_created += 1
                                 part.insert(curr_off, el)
-                                curr_off = round((curr_off + d_p) * 4.0) / 4.0
+                                curr_off = round(curr_off + d_p, 8)
 
                         log.add(f"Durações compostas decompostas: {decomposed_count} | Ligaduras intra-nota criadas: {ties_created}")
 
@@ -2788,7 +3116,9 @@ if uploaded_file is not None:
 
                         harmony_key_context = detected_key if key_success else None
                         chords_by_bar, chord_abstentions = analyze_harmony_root_quality_hmm(
-                            dedup_notes, tempo_data["y_harm"], sr, beat_times, pulse_ql, bar_length_ql, time_sig, harmony_key_context, log
+                            dedup_notes, tempo_data["y_harm"], sr, beat_times,
+                            pulse_ql, bar_length_ql, time_sig, harmony_key_context,
+                            log, timeline=timeline
                         )
 
                         del tempo_data
