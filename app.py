@@ -85,7 +85,7 @@ OUTPUT_DIR = Path("temp_outputs")
 for d in [UPLOAD_DIR, OUTPUT_DIR]:
     d.mkdir(exist_ok=True)
 
-APP_VERSION = "A4.0-Hierarchical-Inference"
+APP_VERSION = "A4.0.1-Hierarchical-Inference"
 
 # ---------------------------------------------------------
 # 1. SISTEMA DE AUDITORIA E LOG TÉCNICO
@@ -208,7 +208,7 @@ CONFIG_QUANTIZATION = {
     "w_onset_error": 1.0,
     "w_dur_error": 0.85,
     "w_complexity": 0.12,
-    "expressible_Single_qls": (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
+    "expressible_single_qls": (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
 }
 
 
@@ -330,7 +330,6 @@ def detectar_centro_tonal_global(part, y_harm=None, sr=22050, all_notes=None, lo
             if np.max(c_mean) > 0:
                 pc_global += 0.45 * (c_mean / np.max(c_mean))
 
-            # Estabilidade tonal em 3 segmentos
             n_frames = chroma_full.shape[1]
             if n_frames >= 30:
                 for s_i in range(3):
@@ -382,7 +381,6 @@ def detectar_centro_tonal_global(part, y_harm=None, sr=22050, all_notes=None, lo
     second_corr, sec_pc, sec_mode = candidates[1]
     margin = best_corr - second_corr
 
-    # Verifica se modo maior e menor da mesma tônica (ou relativa) estão quase empatados
     same_tonic_other = [sc for sc, pc_i, md_i in candidates if pc_i == best_pc and md_i != best_mode]
     mode_diff = best_corr - (same_tonic_other[0] if same_tonic_other else 0.0)
     mode_determined = mode_diff >= 0.025
@@ -433,18 +431,15 @@ def analyze_unified_tempo_and_tatums(y_full, sr, log: TechnicalLogger):
     onset_max = float(np.max(onset_env)) if len(onset_env) > 0 else 0.0
     onset_norm = onset_env / (onset_max + 1e-8) if onset_max > 0 else onset_env
 
-    # Qualidade do sinal rítmico
     rms = float(np.sqrt(np.mean(y_full ** 2)))
     onset_kurt = float(np.percentile(onset_norm, 95) / (np.mean(onset_norm) + 1e-8)) if len(onset_norm) > 0 else 0.0
     signal_quality = float(np.clip(0.5 * min(1.0, rms * 12.0) + 0.5 * min(1.0, onset_kurt / 4.5), 0.1, 1.0))
 
-    # BPM global bruto (primeiros 45s)
     frames_45 = min(len(onset_norm), int(45.0 * sr / hop))
     t_glob, b_glob = librosa.beat.beat_track(onset_envelope=onset_norm[:frames_45], sr=sr, hop_length=hop)
     t_arr = np.asarray(t_glob).reshape(-1)
     global_raw_bpm = float(t_arr[0]) if (t_arr.size > 0 and math.isfinite(float(t_arr[0])) and float(t_arr[0]) > 0) else 120.0
 
-    # Segmentos unificados (calculados uma única vez e reutilizados por todo o sistema)
     win_sec = CONFIG_TACTUS["segment_window_sec"]
     win_frames = int(win_sec * sr / hop)
     segments = []
@@ -475,7 +470,6 @@ def analyze_unified_tempo_and_tatums(y_full, sr, log: TechnicalLogger):
             "onset_env": env_seg,
         })
 
-    # Família completa de candidatos de Tactus
     raw_pool = [global_raw_bpm] + [s["bpm"] for s in segments]
     candidate_pool = []
     for base_b in raw_pool:
@@ -497,7 +491,6 @@ def analyze_unified_tempo_and_tatums(y_full, sr, log: TechnicalLogger):
             merged_groups[-1].append(c)
     unique_cands = [round(float(np.mean(g)), 2) for g in merged_groups]
 
-    # Tempogram global para pontuar os candidatos da família de tactus
     tg_full = librosa.feature.tempogram(onset_envelope=onset_norm[:frames_45], sr=sr, hop_length=hop)
     ac_mean = np.mean(tg_full, axis=1)
     ac_mean = ac_mean / (np.max(ac_mean) + 1e-8)
@@ -508,7 +501,6 @@ def analyze_unified_tempo_and_tatums(y_full, sr, log: TechnicalLogger):
         w0, w1 = max(1, lag - 1), min(len(ac_mean), lag + 2)
         ac_sc = float(np.max(ac_mean[w0:w1])) if w1 > w0 else 0.0
 
-        # Alinhamento harmônico/métrico com os BPMs medidos nos segmentos
         seg_align = []
         for s in segments:
             errs = [abs(cand - s["bpm"] * r) / cand for r in (0.5, 2.0/3.0, 1.0, 1.5, 2.0)]
@@ -528,7 +520,6 @@ def analyze_unified_tempo_and_tatums(y_full, sr, log: TechnicalLogger):
     tactus_family.sort(key=lambda x: x["score"], reverse=True)
     top_tactus_candidates = tactus_family[:5]
 
-    # Extração de Onset Peaks para Tatum Grid
     onset_peaks_frames = librosa.onset.onset_detect(onset_envelope=onset_norm, sr=sr, hop_length=hop, backtrack=False)
     onset_peaks_times = librosa.frames_to_time(onset_peaks_frames, sr=sr, hop_length=hop)
 
@@ -590,7 +581,6 @@ def build_beat_and_tatum_grid(onset_norm, sr, chosen_bpm, total_duration, log: T
 
         beat_times = np.concatenate([np.array(pre), beat_times, np.array(post)])
 
-    # Grade fina de Tatums (6 subdivisões por pulso para capturar semicolcheias e tercinas)
     n_sub = CONFIG_TACTUS["tatum_subdivisions"]
     tatum_times = []
     for i in range(len(beat_times) - 1):
@@ -619,21 +609,15 @@ def seconds_to_musical_position(time_sec: float, beat_times: np.ndarray, pulse_q
 # 7. MOTOR DE COMPASSO HIERÁRQUICO, VITERBI E BOOTSTRAP
 # ---------------------------------------------------------
 def _compute_inner_pulse_subdivision(onset_peaks_times, beat_times_seg):
-    """
-    Histograma de fase interna [0.0, 1.0) entre pulsos consecutivos.
-    Compara contra Template Binário (0.0, 0.5) e Template Ternário (0.0, 0.333, 0.667).
-    """
     n_bins = CONFIG_METER["ternary_phase_bins"]
     tpl_bin = np.zeros(n_bins, dtype=float)
     tpl_tern = np.zeros(n_bins, dtype=float)
 
-    # Binário: picos em 0 e n_bins/2 (ex: 0 e 6 para 12 bins)
     for idx_b in [0, n_bins // 2]:
         tpl_bin[idx_b] = 1.0
         tpl_bin[(idx_b - 1) % n_bins] = 0.25
         tpl_bin[(idx_b + 1) % n_bins] = 0.25
 
-    # Ternário: picos em 0, n_bins/3 e 2*n_bins/3 (ex: 0, 4, 8 para 12 bins)
     for idx_t in [0, n_bins // 3, (2 * n_bins) // 3]:
         tpl_tern[idx_t] = 1.0
         tpl_tern[(idx_t - 1) % n_bins] = 0.20
@@ -667,11 +651,9 @@ def _compute_inner_pulse_subdivision(onset_peaks_times, beat_times_seg):
     sim_bin = cosine_sim(hist_global, tpl_bin)
     sim_tern = cosine_sim(hist_global, tpl_tern)
 
-    # Verifica presença real dos 2 sub-pulsos internos ternários (bins 4 e 8)
     inner_tern_support = min(hist_global[n_bins // 3], hist_global[(2 * n_bins) // 3]) / (np.max(hist_global) + 1e-8)
     rep_ratio = bar_ternary_wins / float(max(1, valid_pulses))
 
-    # Penaliza falsos ternários causados apenas por uma síncope isolada sem repetição tripla
     if inner_tern_support < 0.15 or rep_ratio < 0.28:
         sim_tern *= 0.78
 
@@ -698,7 +680,6 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
     beat_times_local = librosa.frames_to_time(beats + seg["frame_start"], sr=sr, hop_length=hop)
     frames_per_beat = max(2, int(round((60.0 / cand_bpm * sr) / hop)))
 
-    # 1. Periodicidade (2, 3, 4 pulsos)
     tg = librosa.feature.tempogram(onset_envelope=env, sr=sr, hop_length=hop)
     ac = np.mean(tg, axis=1)
     ac = ac / (np.max(ac) + 1e-8)
@@ -714,14 +695,12 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
     per_probs = {k: v / per_sum for k, v in per_raw.items()}
     per_rel = multiclass_reliability(per_probs)
 
-    # 2. Acentuação e Fase (Templates para 2, 3 e 4 pulsos)
     b_acc = np.array([
         float(np.max(env[max(0, int(b) - 2):min(len(env), int(b) + 3)]))
         for b in beats
     ], dtype=float)
     b_z = (b_acc - np.mean(b_acc)) / (np.std(b_acc) + 1e-8)
 
-    # Chroma e Mudança Harmônica nos Beats
     try:
         chroma = librosa.feature.chroma_cqt(y=y_harm_seg, sr=sr, hop_length=hop)
         c_sync = librosa.util.sync(chroma, beats)
@@ -733,7 +712,6 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
         c_norm = np.zeros((12, len(beats)))
         h_diff = np.zeros(len(beats))
 
-    # Presença de Baixo / Notas Graves do Basic Pitch em cada beat
     bass_beat_env = np.zeros(len(beat_times_local), dtype=float)
     if seg_notes:
         for bi, bt in enumerate(beat_times_local):
@@ -777,7 +755,6 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
         bass_probs[p_n] = float(best_b)
         best_phases[p_n] = int(best_f)
 
-    # Normaliza distribuições de feature entre [2, 3, 4]
     def _norm_dict(d):
         s = sum(d.values()) + 1e-8
         return {k: v / s for k, v in d.items()}
@@ -790,7 +767,6 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
     harm_rel = multiclass_reliability(harm_probs)
     bass_rel = multiclass_reliability(bass_probs)
 
-    # 3. Recorrência (Beat Similarity Matrix em lag 2, 3, 4)
     rec_raw = {2: 0.33, 3: 0.33, 4: 0.33}
     if c_norm.shape[1] >= 10:
         sim_m = np.dot(c_norm.T, c_norm)
@@ -800,7 +776,6 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
     rec_probs = _norm_dict(rec_raw)
     rec_rel = multiclass_reliability(rec_probs)
 
-    # 4. Análise Específica Beat 1 vs Beat 3 (Para distinguir 2/4 de 4/4)
     f4 = best_phases[4]
     idx_all = np.arange(len(beats))
     b1_idx = idx_all[(idx_all - f4) % 4 == 0]
@@ -808,7 +783,6 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
 
     beat3_is_continuation = 0.50
     if len(b1_idx) >= 2 and len(b3_idx) >= 2:
-        # Compara força de mudança harmônica e ataque percussivo entre Beat 1 e Beat 3
         h_b1 = float(np.mean(h_diff[b1_idx]))
         h_b3 = float(np.mean(h_diff[b3_idx]))
         a_b1 = float(np.mean(b_acc[b1_idx]))
@@ -816,21 +790,16 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
         bs_b1 = float(np.mean(bass_beat_env[b1_idx]))
         bs_b3 = float(np.mean(bass_beat_env[b3_idx]))
 
-        # Se Beat 1 tem mais mudança de acorde e mais ataque que Beat 3 -> Beat 3 é continuação (favorece 4/4)
-        # Se Beat 1 e Beat 3 são quase idênticos em mudança harmônica e ataque -> cada par é uma barra nova (favorece 2/4)
         asym_h = (h_b1 - h_b3) / (h_b1 + h_b3 + 1e-8)
         asym_a = (a_b1 - a_b3) / (a_b1 + a_b3 + 1e-8)
         asym_b = (bs_b1 - bs_b3) / (bs_b1 + bs_b3 + 1e-8)
         asym_total = 0.45 * asym_h + 0.35 * asym_a + 0.20 * asym_b
         beat3_is_continuation = float(np.clip(0.50 + 1.25 * asym_total, 0.05, 0.95))
 
-    # Ajuste nos agrupamentos 2 vs 4 baseado no comportamento do Beat 3
     b3_rel = binary_reliability(beat3_is_continuation)
 
-    # 5. Subdivisão Interna de Fase (2/4 Simples vs 6/8 Composto)
     p_sub_bin, p_sub_tern, sub_rel, tern_rep = _compute_inner_pulse_subdivision(onset_peaks_times, beat_times_local)
 
-    # Combinação Ponderada por Confiabilidade Automática (Peso Efetivo = Peso Base * Reliability)
     wm = CONFIG_METER
     eff_w_per = wm["w_periodicity"] * (0.25 + 0.75 * per_rel)
     eff_w_acc = wm["w_accent"] * (0.25 + 0.75 * acc_rel)
@@ -849,7 +818,6 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
             eff_w_bass * bass_probs[g]
         ) / w_sum_grp
 
-    # Refinamento 2 vs 4 pelo teste do Beat 3
     if beat3_is_continuation >= wm["beat3_continuation_threshold"]:
         transfer = 0.22 * b3_rel * grp_scores[2]
         grp_scores[4] += transfer
@@ -862,7 +830,6 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
     grp_scores = _norm_dict(grp_scores)
     grouping_quality = multiclass_reliability(grp_scores)
 
-    # Feature Agreement (concordância entre as features independentes sobre o grupo vencedor)
     top_g = max(grp_scores.items(), key=lambda x: x[1])[0]
     feat_votes = [
         max(per_probs.items(), key=lambda x: x[1])[0] == top_g,
@@ -872,20 +839,16 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
     ]
     feature_agreement = float(np.mean(feat_votes))
 
-    # Decisão Hierárquica para Fórmula de Compasso:
-    # A) Grupo 2 -> 2/4 (simples) vs 6/8 (composto ternário)
     eff_sub_tern = 0.50 * (1.0 - sub_rel) + p_sub_tern * sub_rel
     eff_sub_bin = 1.0 - eff_sub_tern
 
     sc_2_4 = grp_scores[2] * (0.55 + 0.45 * eff_sub_bin)
     sc_6_8 = grp_scores[2] * (0.35 + 0.65 * eff_sub_tern) * (1.15 if tern_rep >= 0.35 else 0.72)
 
-    # B) Grupo 3 -> 3/4 (pulso semínima) vs 3/2 (pulso mínima lento/largo)
     slow_pulse_factor = float(np.clip((92.0 - cand_bpm) / 45.0, 0.15, 0.85))
     sc_3_4 = grp_scores[3] * (1.0 - 0.35 * slow_pulse_factor)
     sc_3_2 = grp_scores[3] * (0.45 + 0.55 * slow_pulse_factor)
 
-    # C) Grupo 4 -> 4/4
     sc_4_4 = grp_scores[4] * (0.60 + 0.40 * eff_sub_bin)
 
     ts_probs = _norm_dict({"2/4": sc_2_4, "3/4": sc_3_4, "4/4": sc_4_4, "6/8": sc_6_8, "3/2": sc_3_2})
@@ -921,9 +884,6 @@ def _evaluate_segment_for_tactus(seg, y_harm_seg, y_perc_seg, sr, cand_bpm, onse
 
 
 def extract_meter_features(joint_hypotheses, quality_metrics) -> dict:
-    """
-    Vetor padronizado de features métricas preparado para futuro modelo especialista ONNX/XGBoost.
-    """
     top_h = joint_hypotheses[0] if joint_hypotheses else {}
     return {
         "tactus_bpm": float(top_h.get("tactus_bpm", 120.0)),
@@ -969,7 +929,6 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
             }
         }
 
-    # Avalia hipóteses conjuntas H = (tactus_candidate, segment_evaluations)
     joint_hypotheses = []
     tactus_evaluations = {}
 
@@ -1025,12 +984,32 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
                 "beat3_cont": round(float(np.mean([e["beat3_cont"] for e in seg_evals])), 3),
             })
 
+    if not joint_hypotheses:
+        return {
+            "chosen_bpm": tempo_data["global_raw_bpm"],
+            "time_sig": "4/4",
+            "status": "ambiguous",
+            "confidence_label": "inconclusiva",
+            "pulse_ql": 1.0,
+            "meter_sections": [{"start_sec": 0.0, "time_sig": "4/4"}],
+            "qualities": {
+                "signal_quality": tempo_data["signal_quality"],
+                "beat_quality": 0.5,
+                "tactus_quality": 0.5,
+                "grouping_quality": 0.0,
+                "subdivision_quality": 0.0,
+                "feature_agreement": 0.0,
+                "sequence_stability": 0.0,
+                "bootstrap_stability": 0.0,
+                "decision_quality": 0.0,
+            }
+        }
+
     joint_hypotheses.sort(key=lambda x: x["score"], reverse=True)
     best_h = joint_hypotheses[0]
     chosen_bpm = best_h["tactus_bpm"]
     seg_evals_chosen = tactus_evaluations[chosen_bpm]
 
-    # Viterbi Temporal sobre os segmentos para detectar estabilidade ou mudança de compasso
     states = ["2/4", "3/4", "4/4", "6/8", "3/2"]
     n_st = len(states)
     n_win = len(seg_evals_chosen)
@@ -1060,7 +1039,6 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
     viterbi_idx.reverse()
     viterbi_path = [states[i] for i in viterbi_idx]
 
-    # Construção de meter_sections
     meter_sections = []
     for t, st_name in enumerate(viterbi_path):
         t_sec = 0.0 if t == 0 else round(seg_evals_chosen[t]["time_start"], 2)
@@ -1069,7 +1047,6 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
 
     sequence_stability = float(viterbi_path.count(viterbi_path[0]) / float(len(viterbi_path)))
 
-    # Bootstrap / Monte Carlo leve (40 recombinações com perturbação proporcional à incerteza)
     rng = np.random.default_rng(42)
     n_boot = CONFIG_CONFIDENCE["bootstrap_iterations"]
     boot_counts = {c: 0 for c in states}
@@ -1084,7 +1061,6 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
         win_c = max(agg.items(), key=lambda x: x[1])[0]
         boot_counts[win_c] += 1
 
-    # Scores globais no tactus escolhido
     global_ts_scores = {c: float(np.mean([e["ts_probs"][c] for e in seg_evals_chosen])) for c in states}
     g_tot = sum(global_ts_scores.values()) + 1e-8
     global_ts_scores = {k: v / g_tot for k, v in global_ts_scores.items()}
@@ -1096,7 +1072,6 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
 
     bootstrap_stability = boot_counts[best_ts] / float(n_boot)
 
-    # Métricas separadas de qualidade
     tactus_quality = float(top_tactus[0]["score"])
     grouping_quality = float(np.mean([e["grouping_quality"] for e in seg_evals_chosen]))
     subdivision_quality = float(np.mean([e["sub_rel"] for e in seg_evals_chosen]))
@@ -1111,7 +1086,6 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
         0.0, 1.0
     ))
 
-    # Limiar adaptativo e regra de Abstention
     base_thr = CONFIG_CONFIDENCE["base_margin_threshold"]
     adj_thr = -0.025 * (decision_quality - 0.55) - 0.020 * (bootstrap_stability - 0.65)
     eff_thr = float(np.clip(base_thr + adj_thr, CONFIG_CONFIDENCE["min_margin_abs"], CONFIG_CONFIDENCE["max_margin_abs"]))
@@ -1137,12 +1111,10 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
     pulse_ql_map = {"2/4": 1.0, "3/4": 1.0, "4/4": 1.0, "6/8": 1.5, "3/2": 2.0}
     pulse_ql = pulse_ql_map.get(final_ts, 1.0)
 
-    # Médias das reliabilities das features
     avg_rels = {}
     for k_r in ("periodicity", "accent", "subdivision", "harmonic_change", "recurrence", "bass"):
         avg_rels[k_r] = float(np.mean([e["reliabilities"][k_r] for e in seg_evals_chosen]))
 
-    # Log Detalhado
     log.add("\n==============================\nHIERARCHICAL METER & VITERBI ENGINE\n==============================")
     log.add("Top Hipóteses Conjuntas (Tactus + Agrupamento + Subdivisão + Fase):")
     for h_i in joint_hypotheses[:6]:
@@ -1336,7 +1308,6 @@ def track_melody_viterbi_a4(dedup_notes, onset_norm, sr, log: TechnicalLogger):
     no_mel_thr = CONFIG_MELODY["no_melody_threshold"]
     no_mel_trans_pen = CONFIG_MELODY["no_melody_transition_cost"]
 
-    # Em cada frame t, os estados são: 0..K-1 (notas candidatas) e o estado K = NO_MELODY
     dp_scores = []
     dp_back = []
     dp_last_pitch = []
@@ -1349,7 +1320,6 @@ def track_melody_viterbi_a4(dedup_notes, onset_norm, sr, log: TechnicalLogger):
         curr_lp = np.full(k_notes + 1, mel_center_pitch, dtype=float)
         curr_le = np.zeros(k_notes + 1, dtype=float)
 
-        # Emission scores das notas do frame
         em_scores = np.zeros(k_notes, dtype=float)
         for i, nt in enumerate(frame_notes):
             vel_norm = np.clip((nt.velocity - v_eff) / (127.0 - v_eff + 1e-8), 0.0, 1.0)
@@ -1373,7 +1343,6 @@ def track_melody_viterbi_a4(dedup_notes, onset_norm, sr, log: TechnicalLogger):
             prev_le = dp_last_end[t_idx - 1]
             n_prev_states = len(prev_scores)
 
-            # Transições para cada nota candidata i
             for i, nt in enumerate(frame_notes):
                 best_sc = -1e9
                 best_j = 0
@@ -1381,7 +1350,6 @@ def track_melody_viterbi_a4(dedup_notes, onset_norm, sr, log: TechnicalLogger):
                     gap = max(0.0, nt.start_sec - prev_le[j])
                     interval = abs(nt.pitch - prev_lp[j])
 
-                    # Penalidade dependente do delta de tempo e Phrase Reset
                     if gap >= CONFIG_MELODY["phrase_reset_gap_sec"]:
                         gap_mult = CONFIG_MELODY["phrase_reset_jump_mult"]
                         oct_pen = 0.0
@@ -1406,7 +1374,6 @@ def track_melody_viterbi_a4(dedup_notes, onset_norm, sr, log: TechnicalLogger):
                 curr_lp[i] = float(nt.pitch)
                 curr_le[i] = float(nt.end_sec)
 
-            # Transição para o estado NO_MELODY (índice k_notes)
             best_nm_sc = -1e9
             best_nm_j = 0
             for j in range(n_prev_states):
@@ -1424,7 +1391,6 @@ def track_melody_viterbi_a4(dedup_notes, onset_norm, sr, log: TechnicalLogger):
         dp_last_pitch.append(curr_lp)
         dp_last_end.append(curr_le)
 
-    # Backtracking
     melody_line = []
     no_melody_frames = 0
     curr_st = int(np.argmax(dp_scores[-1]))
@@ -1438,11 +1404,9 @@ def track_melody_viterbi_a4(dedup_notes, onset_norm, sr, log: TechnicalLogger):
         curr_st = int(dp_back[t_idx][curr_st])
     melody_line.reverse()
 
-    # Caso todos os frames tenham caído em NO_MELODY por áudio extremamente baixo, pega o melhor por frame
     if not melody_line and frames:
         melody_line = [max(f, key=lambda x: x.velocity) for f in frames]
 
-    # Resolve sobreposições e contabiliza phrase resets
     phrase_resets = 0
     intervals = []
     for i in range(len(melody_line) - 1):
@@ -1516,7 +1480,6 @@ def analyze_harmony_root_quality_hmm(
     hop = CONFIG_SIGNAL["hop_length"]
     use_flats = prefer_flats_for_key(detected_key)
 
-    # Prior diatônico leve a partir da tonalidade detectada
     key_pcs = set()
     if detected_key is not None:
         try:
@@ -1539,7 +1502,6 @@ def analyze_harmony_root_quality_hmm(
     log.add(f"VELOCITY HARMONIA -> Base={v_h_base:.1f} | Medido(P28)={v_h_adapt:.1f} | Efetivo={v_h_eff:.1f}")
     log.add(f"PESO ACORDE       -> Base={peso_base:.3f} | Medido(Med={w_med:.3f}, P70={w_p70:.3f}) | Adapt={peso_adapt:.3f} | Efetivo={peso_eff:.3f}")
 
-    # Chroma CQT sincronizado para reforçar evidência harmônica
     try:
         chroma_full = librosa.feature.chroma_cqt(y=y_harm, sr=sr, hop_length=hop)
     except Exception:
@@ -1596,7 +1558,6 @@ def analyze_harmony_root_quality_hmm(
             if np.max(pc_notes) > 0:
                 pc_notes = pc_notes / np.max(pc_notes)
 
-            # Junta com Chroma CQT da mesma janela temporal
             pc_chroma = np.zeros(12, dtype=float)
             if chroma_full is not None and t_starts:
                 f0 = max(0, int(round(min(t_starts) * sr / hop)))
@@ -1611,7 +1572,7 @@ def analyze_harmony_root_quality_hmm(
                 continue
             pc_comb = pc_comb / np.max(pc_comb)
 
-            # ETAPA 1: Estimativa de ROOT (Fundamental)
+            # ETAPA 1: Estimativa de ROOT
             root_scores = {}
             for r_pc in range(12):
                 if pc_comb[r_pc] < 0.15:
@@ -1635,13 +1596,12 @@ def analyze_harmony_root_quality_hmm(
                 abstention_count += 1
                 continue
 
-            # ETAPA 2: Estimativa de QUALITY (Qualidade do Acorde dado o Root)
+            # ETAPA 2: Estimativa de QUALITY
             rel_iv = np.roll(pc_comb, -best_root)
             e_m3 = float(rel_iv[3])
             e_M3 = float(rel_iv[4])
             e_sus4 = float(rel_iv[5])
 
-            # Se não há terça maior, terça menor nem quarta suspensa suficiente (ex: apenas C + G), Quality = UNKNOWN
             max_discriminant = max(e_m3, e_M3, e_sus4)
             root_str = pc_to_note_name(best_root, use_flats=use_flats)
 
@@ -1669,7 +1629,6 @@ def analyze_harmony_root_quality_hmm(
             for q_name, req_ivs, pen_ivs, mpb_suf, xml_suf in CHORD_QUALITY_SPECS:
                 pos_sc = sum(rel_iv[iv] * w_iv for iv, w_iv in req_ivs.items()) / float(sum(req_ivs.values()))
                 pen_sc = sum(rel_iv[iv] * abs(w_pen) for iv, w_pen in pen_ivs.items() if rel_iv[iv] > 0.25)
-                # Leve parcimônia para extensões complexas
                 ext_pen = 0.04 * max(0, len(req_ivs) - 2)
                 q_sc = float(np.clip(pos_sc - 0.35 * pen_sc - ext_pen, 0.0, 1.0))
                 qual_cands.append((q_sc, q_name, mpb_suf, xml_suf))
@@ -1728,8 +1687,8 @@ def analyze_harmony_root_quality_hmm(
                 "reason": "Evidência harmônica suficiente",
             })
 
-    # ETAPA 3: Continuidade Harmônica / HMM Smoothing (evita oscilações espúrias C -> Cm -> C)
-    valid_ vocabulary = sorted(list({r["mpb_sym"] for r in raw_regions if r["mpb_sym"] is not None}))
+    # ETAPA 3: Continuidade Harmônica / HMM Smoothing
+    valid_vocabulary = sorted(list({r["mpb_sym"] for r in raw_regions if r["mpb_sym"] is not None}))
     chords_by_bar = defaultdict(list)
 
     if valid_vocabulary and raw_regions:
@@ -1773,7 +1732,6 @@ def analyze_harmony_root_quality_hmm(
         for t, reg in enumerate(raw_regions):
             hmm_sym = valid_vocabulary[path_v[t]]
             if reg["mpb_sym"] is None:
-                # Se a qualidade era UNKNOWN, só mantém acorde anterior se tiver a mesma raiz; caso contrário, abstém-se
                 if prev_chosen and prev_chosen.startswith(reg["root_str"]):
                     chosen_mpb = prev_chosen
                     chosen_xml = sym_to_xml[chosen_mpb]
@@ -1810,7 +1768,6 @@ def analyze_harmony_root_quality_hmm(
                     "confidence": reg["chord_conf"],
                 })
 
-        # Consolida acordes iguais na mesma medida
         for b_k in list(chords_by_bar.keys()):
             c_list = chords_by_bar[b_k]
             if len(c_list) >= 2 and c_list[0]["mpb_sym"] == c_list[1]["mpb_sym"]:
@@ -1824,14 +1781,10 @@ def analyze_harmony_root_quality_hmm(
 # 11. QUANTIZAÇÃO GLOBAL ÓTIMA E DECOMPOSIÇÃO DE DURAÇÕES
 # ---------------------------------------------------------
 def decompose_into_expressible_durations(dur_ql: float) -> list:
-    """
-    Garante que qualquer duração em QuarterLength (múltiplo de 0.25) seja expressável em MusicXML.
-    Se for uma duração composta (ex: 1.25, 1.75, 2.25, 2.5, 2.75, 3.5), decompõe em figuras ligadas.
-    """
     q = round(float(dur_ql) * 4.0) / 4.0
     if q <= 0.0:
         return [0.25]
-    expressible = set(CONFIG_QUANTIZATION["expressible_Single_qls"])
+    expressible = set(CONFIG_QUANTIZATION["expressible_single_qls"])
     if q in expressible:
         return [q]
 
@@ -1854,7 +1807,7 @@ def quantize_melody_dp_global(melody_notes, beat_times, pulse_ql, bar_length_ql,
     w_on = CONFIG_QUANTIZATION["w_onset_error"]
     w_dur = CONFIG_QUANTIZATION["w_dur_error"]
     w_cx = CONFIG_QUANTIZATION["w_complexity"]
-    expressible = set(CONFIG_QUANTIZATION["expressible_Single_qls"])
+    expressible = set(CONFIG_QUANTIZATION["expressible_single_qls"])
 
     quantized_events = []
     onset_errors = []
@@ -1865,7 +1818,6 @@ def quantize_melody_dp_global(melody_notes, beat_times, pulse_ql, bar_length_ql,
         raw_e = seconds_to_musical_position(n.end_sec, beat_times, pulse_ql=pulse_ql)
         raw_d = max(sub_ql, raw_e - raw_s)
 
-        # Testa os 2 pontos de grade mais próximos para o início e 2 para o fim
         s_floor = math.floor(raw_s / sub_ql) * sub_ql
         s_cands = [round(s_floor * 4.0) / 4.0, round((s_floor + sub_ql) * 4.0) / 4.0]
 
@@ -1880,7 +1832,6 @@ def quantize_melody_dp_global(melody_notes, beat_times, pulse_ql, bar_length_ql,
                 ec = round((sc + dc) * 4.0) / 4.0
                 on_err = abs(sc - raw_s)
                 dur_err = abs(dc - raw_d)
-                # Penalidade de complexidade se cair fora de tempo/contratempo principal ou exigir decomposição
                 cx_pen = (0.0 if (sc * 2.0).is_integer() else 0.35) + (0.0 if dc in expressible else 0.45)
                 cost = w_on * on_err + w_dur * dur_err + w_cx * cx_pen
                 if cost < best_cost:
@@ -1902,7 +1853,6 @@ def quantize_melody_dp_global(melody_notes, beat_times, pulse_ql, bar_length_ql,
             "end_sec": n.end_sec,
         })
 
-    # Garante monofonia limpa sem colisão de offsets
     quantized_events.sort(key=lambda x: (x["start_ql"], -x["velocity"]))
     clean_events = []
     for ev in quantized_events:
@@ -1938,11 +1888,6 @@ def quantize_melody_dp_global(melody_notes, beat_times, pulse_ql, bar_length_ql,
 
 
 def auditar_e_sanitizar_duracoes_musicxml(stream_obj, log: TechnicalLogger):
-    """
-    Audita estritamente Note, Rest e Chord musical.
-    Ignora completamente Harmony / ChordSymbol (que possuem quarterLength=0.0 por natureza).
-    Registra e contabiliza apenas quando o valor corrigido for realmente diferente do original.
-    """
     corrigidos = 0
     for m in stream_obj.recurse().getElementsByClass(music21.stream.Measure):
         m_num = m.number
@@ -2047,10 +1992,9 @@ if uploaded_file is not None:
                 total_duration = len(y_full) / float(sr)
                 log.add(f"Duração: {total_duration:.2f}s | Sample Rate: {sr} Hz | Canais originais: {orig_channels} (Mid/Side Ratio={ms_ratio:.2f})")
 
-                # 1. Fonte única de BPM, Segmentos e Família de Tactus
                 tempo_data = analyze_unified_tempo_and_tatums(y_full, sr, log)
+                global_raw_bpm_val = tempo_data["global_raw_bpm"]
 
-                # 2. Inferência Basic Pitch com Overlap e Deduplicação
                 raw_notes, dedup_notes = infer_notes_with_overlap(y_full, sr, session_dir, ai_model, log)
                 del y_full
                 gc.collect()
@@ -2060,10 +2004,9 @@ if uploaded_file is not None:
                     st.session_state["log_text"] = log.get_text()
                     st.error("Nenhuma nota musical clara foi detectada neste arquivo de áudio.")
                 else:
-                    # 3. Inferência Hierárquica Conjunta de Tactus e Compasso
                     if compasso_selecionado != "Automático":
                         time_sig = compasso_selecionado
-                        bpm = round(float(tempo_data["top_tactus"][0]["bpm"]), 1) if tempo_data["top_tactus"] else tempo_data["global_raw_bpm"]
+                        bpm = round(float(tempo_data["top_tactus"][0]["bpm"]), 1) if tempo_data["top_tactus"] else global_raw_bpm_val
                         compasso_exibicao = f"{time_sig} (Manual)"
                         meter_status = "manual"
                         meter_conf_str = "manual"
@@ -2094,7 +2037,6 @@ if uploaded_file is not None:
                         else:
                             compasso_exibicao = f"Não determinado (Fallback {time_sig})"
 
-                    # 4. Construção da Grade de Beats e Tatums para o Tactus escolhido
                     beat_times, tatum_times, beat_quality = build_beat_and_tatum_grid(
                         tempo_data["onset_norm"], sr, bpm, total_duration, log
                     )
@@ -2103,7 +2045,6 @@ if uploaded_file is not None:
                     num, den = map(int, time_sig.split("/"))
                     bar_length_ql = float(num) * (4.0 / float(den))
 
-                    # 5. Melody Tracking (Viterbi + Phrase Reset + NO_MELODY)
                     melody_notes, mel_conf = track_melody_viterbi_a4(dedup_notes, tempo_data["onset_norm"], sr, log)
 
                     if not melody_notes:
@@ -2111,9 +2052,6 @@ if uploaded_file is not None:
                         st.session_state["log_text"] = log.get_text()
                         st.warning("Foram detectadas notas no áudio, mas nenhuma formou uma linha melódica consistente.")
                     else:
-                        # ---------------------------------------------------------
-                        # EXPORTAÇÃO MIDI (Estritamente em segundos reais)
-                        # ---------------------------------------------------------
                         midi_path = OUTPUT_DIR / f"partitura_{session_id}.mid"
                         pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
                         inst = pretty_midi.Instrument(program=0)
@@ -2128,9 +2066,6 @@ if uploaded_file is not None:
                         pm.write(str(midi_path))
                         midi_status = "OK"
 
-                        # ---------------------------------------------------------
-                        # QUANTIZAÇÃO GLOBAL DP E DECOMPOSIÇÃO DE DURAÇÕES
-                        # ---------------------------------------------------------
                         quant_events, quant_err_stats = quantize_melody_dp_global(
                             melody_notes, beat_times, pulse_ql, bar_length_ql, log
                         )
@@ -2142,9 +2077,8 @@ if uploaded_file is not None:
 
                         part = music21.stream.Part()
                         part.insert(0, music21.clef.TrebleClef())
-                        part.insert(0, music21. tempo.MetronomeMark(number=bpm))
+                        part.insert(0, music21.tempo.MetronomeMark(number=bpm))
 
-                        # Insere mudanças de compasso se meter_sections tiver múltiplas seções confirmadas
                         if len(meter_sections) > 1 and meter_status == "detected":
                             for sec_m in meter_sections:
                                 sec_ql = round(seconds_to_musical_position(sec_m["start_sec"], beat_times, pulse_ql=pulse_ql) / bar_length_ql) * bar_length_ql
@@ -2189,7 +2123,6 @@ if uploaded_file is not None:
 
                         log.add(f"Durações compostas decompostas: {decomposed_count} | Ligaduras intra-nota criadas: {ties_created}")
 
-                        # 6. Tonalidade Global Híbrida
                         detected_key, key_success, key_conf, tonic_pt, mode_pt = detectar_centro_tonal_global(
                             part, y_harm=tempo_data["y_harm"], sr=sr, all_notes=dedup_notes, log=log
                         )
@@ -2199,7 +2132,6 @@ if uploaded_file is not None:
                         part.makeTies(inPlace=True)
                         corr_pre = auditar_e_sanitizar_duracoes_musicxml(part, log)
 
-                        # 7. Harmonia (Root -> Quality -> HMM Smoothing)
                         chords_by_bar, chord_abstentions = analyze_harmony_root_quality_hmm(
                             dedup_notes, tempo_data["y_harm"], sr, beat_times, pulse_ql, bar_length_ql, detected_key, log
                         )
@@ -2233,9 +2165,6 @@ if uploaded_file is not None:
 
                         score.insert(0, part)
 
-                        # ---------------------------------------------------------
-                        # ETAPA 1: Renderização em PDF via LilyPond
-                        # ---------------------------------------------------------
                         pdf_bytes = None
                         page_images = []
                         try:
@@ -2263,9 +2192,6 @@ if uploaded_file is not None:
                                 "O processamento do MIDI e do MusicXML continuará normalmente."
                             )
 
-                        # ---------------------------------------------------------
-                        # ETAPA 2: Inserção de ChordSymbol e Exportação MusicXML
-                        # ---------------------------------------------------------
                         for m_obj, off_ql, mpb_sym, xml_sym in xml_chords_to_insert:
                             try:
                                 cs_obj = music21.harmony.ChordSymbol(xml_sym)
@@ -2296,13 +2222,12 @@ if uploaded_file is not None:
                         midi_path.unlink(missing_ok=True)
                         xml_path.unlink(missing_ok=True)
 
-                        # Resumo Final Completo no Log Técnico
                         log.add("\n===================================")
                         log.add("PARTITURA.AI — RESUMO FINAL")
                         log.add("===================================")
                         log.add(f"Arquivo: {uploaded_file.name}")
                         log.add(f"Duração: {total_duration:.2f}s")
-                        log.add(f"BPM bruto: {raw_notes and bpm or bpm:.2f} | Tactus principal: {bpm:.1f} BPM | Tactus Quality: {meter_qualities['tactus_quality']:.3f}")
+                        log.add(f"BPM bruto: {global_raw_bpm_val:.2f} | Tactus principal: {bpm:.1f} BPM | Tactus Quality: {meter_qualities['tactus_quality']:.3f}")
                         log.add(
                             f"Compasso: {compasso_exibicao} | Status: {meter_status} | "
                             f"Decision Confidence: {meter_qualities['decision_quality']:.3f} | "
