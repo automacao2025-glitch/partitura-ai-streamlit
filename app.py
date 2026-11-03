@@ -85,7 +85,7 @@ OUTPUT_DIR = Path("temp_outputs")
 for d in [UPLOAD_DIR, OUTPUT_DIR]:
     d.mkdir(exist_ok=True)
 
-APP_VERSION = "A4.2.1-Hierarchical-Pulse-Bar-RawGrid-Calibrated"
+APP_VERSION = "A4.3-Dual-Level-Bar-Phrase-Evidence"
 
 # ---------------------------------------------------------
 # 1. SISTEMA DE AUDITORIA E LOG TÉCNICO
@@ -173,6 +173,31 @@ CONFIG_METER = {
     # Priors estruturais fracos, usados só como regularização contínua.
     "recurrence_2bar_center": 0.72,
     "recurrence_2bar_scale": 0.075,
+}
+
+CONFIG_DUAL_BAR = {
+    # Especialista binário 2/4 x 4/4: não muda 3/4 e 6/8.
+    # Quatro janelas representativas; as features são obtidas do áudio, nunca da referência.
+    "enabled": True,
+    "analysis_sr": 11025,
+    "analysis_window_sec": 28.0,
+    "analysis_positions": (0.20, 0.45, 0.70, 0.87),
+    "analysis_hop": 256,
+    "n_mels": 16,
+    "min_valid_windows": 3,
+    "binary_family_min_mass": 0.37,
+    # Evidence favorável a 4/4 em two-feel: recorrência de 16 vs 8 beats.
+    # Soft gate + consistência entre janelas para evitar um único trecho anômalo.
+    "phrase_negative_center": -0.095,
+    "phrase_negative_scale": 0.018,
+    "window_negative_cutoff": -0.090,
+    "negative_fraction_center": 0.57,
+    "negative_fraction_scale": 0.075,
+    "target_four_share": 0.80,
+    "max_blend": 0.90,
+    # Evitar sobreconfiança: evidência 2/4 x 4/4 discordante permite abstention.
+    "conflict_min_support": 0.45,
+    "conflict_margin_penalty": 0.020,
 }
 
 CONFIG_CONFIDENCE = {
@@ -1155,9 +1180,153 @@ def _stabilize_meter_path(path, min_run=2):
     return out
 
 
+def _phrase_8v16_evidence(window_deltas, tempo_cv=0.0):
+    """Retorna evidência contínua de barra longa, nunca um rótulo fechado.
+
+    Usamos a mediana e a repetição entre janelas para não confundir uma única
+    quebra de frase com estrutura 4/4. A magnitude não é probabilidade calibrada.
+    """
+    cfg = CONFIG_DUAL_BAR
+    v = np.asarray(window_deltas, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size < cfg["min_valid_windows"]:
+        return {"support_4": 0.0, "valid": False, "median": None,
+                "mean": None, "negative_fraction": 0.0, "window_count": int(v.size),
+                "tempo_cv": float(tempo_cv)}
+    median = float(np.median(v))
+    neg_fraction = float(np.mean(v < cfg["window_negative_cutoff"]))
+    depth = _sigmoid((cfg["phrase_negative_center"] - median) /
+                     cfg["phrase_negative_scale"])
+    persistent = _sigmoid((neg_fraction - cfg["negative_fraction_center"]) /
+                          cfg["negative_fraction_scale"])
+    # Se o rastreamento do pulso oscila, há mais incerteza sobre a comparação
+    # exata de 8/16 beats. Não transforma BPM em rótulo de compasso.
+    tempo_rel = float(np.clip(1.0 - max(0.0, tempo_cv - 0.04) / 0.28, 0.40, 1.0))
+    support = float(np.clip(depth * persistent * tempo_rel, 0.0, 1.0))
+    return {"support_4": support, "valid": True, "median": median,
+            "mean": float(np.mean(v)), "negative_fraction": neg_fraction,
+            "window_count": int(v.size), "tempo_cv": float(tempo_cv)}
+
+
+def _dual_bar_phrase_profile(tempo_data, sr):
+    """Extrai uma feature musical de frase longa com baixo custo de RAM.
+
+    Trabalha em pequenos trechos, usa o pulso acústico bruto e não requer
+    Basic Pitch, modelos extras, matriz N² nem dependências além de Librosa/NumPy.
+    """
+    cfg = CONFIG_DUAL_BAR
+    full_len = int(len(tempo_data["y_harm"]))
+    duration = float(tempo_data.get("total_duration", full_len / sr))
+    target_sr = int(cfg["analysis_sr"])
+    hop = int(cfg["analysis_hop"])
+    win_sec = float(cfg["analysis_window_sec"])
+    window_deltas = []
+    details = []
+    raw_bpms = [float(s.get("bpm", 0.0)) for s in tempo_data.get("segments", [])
+                if float(s.get("bpm", 0.0)) > 0.0]
+    tempo_cv = float(np.std(raw_bpms) / max(np.mean(raw_bpms), 1e-8)) if raw_bpms else 0.5
+
+    for pos in cfg["analysis_positions"]:
+        try:
+            start = max(0.0, float(duration)*float(pos) - win_sec / 2.0)
+            start = min(start, max(0.0, duration - win_sec - 1.0))
+            a = max(0, int(start*sr))
+            b = min(full_len, a + int(win_sec*sr))
+            if b - a < int(18.0*sr):
+                continue
+            # Reusa os componentes HPSS: só cria um trecho mono curto.
+            wave = np.asarray(tempo_data["y_harm"][a:b] +
+                              tempo_data["y_perc"][a:b], dtype=np.float32)
+            if sr != target_sr:
+                wave = librosa.resample(wave, orig_sr=sr, target_sr=target_sr)
+            spec = np.abs(librosa.stft(wave, n_fft=1024, hop_length=hop))
+            power = np.square(spec)
+            onset = librosa.onset.onset_strength(
+                S=librosa.power_to_db(power + 1e-7), sr=target_sr, hop_length=hop)
+            _tempo, bframes = librosa.beat.beat_track(
+                onset_envelope=onset, sr=target_sr, hop_length=hop, trim=False)
+            bframes = np.asarray(bframes, dtype=int).reshape(-1)
+            if bframes.size < 26:
+                continue
+            mel = librosa.feature.melspectrogram(
+                S=power, sr=target_sr, n_mels=int(cfg["n_mels"]), fmax=5000)
+            mel = np.log1p(mel)
+            chroma = librosa.feature.chroma_stft(S=power, sr=target_sr, n_chroma=12)
+            rms = librosa.feature.rms(S=spec, frame_length=1024)[0]
+            centroid = librosa.feature.spectral_centroid(S=spec, sr=target_sr)[0]
+            nframes = min(chroma.shape[1], mel.shape[1], len(onset), len(rms), len(centroid))
+            feature = np.vstack((chroma[:, :nframes],
+                mel[:, :nframes] / max(1e-5, float(np.max(mel))),
+                onset[np.newaxis, :nframes],
+                rms[np.newaxis, :nframes]*5.0,
+                centroid[np.newaxis, :nframes]/3000.0))
+            beat_features = []
+            for l, r in zip(bframes[:-1], bframes[1:]):
+                l = int(max(0,l)); r = int(min(nframes,r))
+                if r > l:
+                    beat_features.append(np.mean(feature[:, l:r], axis=1))
+            if len(beat_features) < 25:
+                continue
+            B = np.asarray(beat_features, dtype=float)
+            B = (B - np.median(B, axis=0)) / (np.std(B, axis=0) + 0.20)
+            B = B / (np.linalg.norm(B, axis=1, keepdims=True) + 1e-9)
+            sim8 = float(np.mean(np.sum(B[8:]*B[:-8], axis=1)))
+            sim16 = float(np.mean(np.sum(B[16:]*B[:-16], axis=1)))
+            delta = float(sim16 - sim8)
+            if not math.isfinite(delta):
+                continue
+            window_deltas.append(delta)
+            details.append({"center_sec": round(start + win_sec/2.0, 2),
+                            "beats": len(B), "sim8": round(sim8, 4),
+                            "sim16": round(sim16, 4), "delta": round(delta, 4)})
+        except (ValueError, FloatingPointError, RuntimeError, TypeError, IndexError):
+            # Problema de feature não derruba o aplicativo: caso ambíguo é
+            # resolvido pelo motor métrico original e pela abstention.
+            continue
+
+    evidence = _phrase_8v16_evidence(window_deltas, tempo_cv)
+    evidence["window_deltas"] = [float(x) for x in window_deltas]
+    evidence["windows"] = details
+    return evidence
+
+
+def _apply_dual_bar_specialist(scores, phrase_evidence, raw_grid_stats=None):
+    """Corrige apenas a distribuição interna da família binária 2/4 e 4/4.
+
+    O sinal acústico negativo persistente (16 versus 8 beats) é evidência
+    extra de barra longa em um two-feel, NÃO uma certeza editorial universal.
+    """
+    out = {s: float(v) for s,v in scores.items()}
+    info = {"applied": False, "support": 0.0, "reason": "sem evidência suficiente"}
+    if not phrase_evidence.get("valid"):
+        return out, info
+    pair_mass = out.get("2/4", 0.0) + out.get("4/4", 0.0)
+    if pair_mass < CONFIG_DUAL_BAR["binary_family_min_mass"]:
+        info["reason"] = "família binária com pouca evidência"
+        return out, info
+    # Evita mexer em 3/4 e 6/8 claros, mesmo havendo uma célula binária forte.
+    ranked = sorted(out.items(), key=lambda x: x[1], reverse=True)
+    if ranked[0][0] not in ("2/4", "4/4"):
+        info["reason"] = "líder não pertence à família binária"
+        return out, info
+    supp = float(phrase_evidence.get("support_4", 0.0))
+    mix = float(CONFIG_DUAL_BAR["max_blend"] * supp)
+    if mix <= 1e-5:
+        return out, info
+    current_four = out["4/4"] / max(pair_mass, 1e-8)
+    target_four = float(CONFIG_DUAL_BAR["target_four_share"])
+    new_four = (1.0 - mix)*current_four + mix*target_four
+    out["4/4"] = pair_mass * new_four
+    out["2/4"] = pair_mass * (1.0-new_four)
+    info.update({"applied": True, "support": supp, "mix": mix,
+                 "old_four_share": current_four, "new_four_share": new_four,
+                 "reason": "evidência contínua de frase longa"})
+    return out, info
+
+
 def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: TechnicalLogger):
     """
-    A4.2: inferência hierárquica TATUM -> PULSE -> BAR.
+    A4.3: inferência hierárquica TATUM -> PULSE -> BAR + especialista de frase longa.
     A confiança do compasso é marginalizada sobre tactus plausíveis; a confiança do tactus é separada.
     """
     segments = tempo_data["segments"]
@@ -1359,6 +1528,16 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
         zc = sum(meter_scores.values()) + 1e-8
         meter_scores = {st:meter_scores[st]/zc for st in states}
 
+    # A4.3: análise leve da recorrência de frase longa. Ela também é usada quando
+    # o motor A4.2 estaria excessivamente confiante em 2/4.
+    phrase_profile = {"valid": False, "support_4": 0.0, "window_deltas": [], "windows": []}
+    if (CONFIG_DUAL_BAR["enabled"] and
+            meter_scores["2/4"] + meter_scores["4/4"] >= CONFIG_DUAL_BAR["binary_family_min_mass"] and
+            max(meter_scores, key=meter_scores.get) in ("2/4", "4/4")):
+        phrase_profile = _dual_bar_phrase_profile(tempo_data, sr)
+    meter_scores, dual_bar_info = _apply_dual_bar_specialist(
+        meter_scores, phrase_profile, raw_calibration_stats)
+
     ranked = sorted(meter_scores.items(), key=lambda kv: kv[1], reverse=True)
     best_ts, best_sc = ranked[0]
     sec_ts, sec_sc = ranked[1]
@@ -1412,7 +1591,7 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
     raw_bpm=float(tempo_data.get("global_raw_bpm",120.0))
     for _ in range(n_boot):
         numer={s:0.0 for s in states}; den={s:0.0 for s in states}; best_local={s:0.0 for s in states}
-        best_pairs=[]
+        conditional_pairs={st:{} for st in states}
         best_comp_rel_boot=0.0
         for w,b in zip(tactus_weights,candidate_bpms):
             evals=tactus_evaluations[b]
@@ -1427,7 +1606,6 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
             triple_rel=math.exp(-0.5*((ratio-3.0)/0.48)**2)
             xx=float(np.clip((comp-0.62)/0.25,0.0,1.0)); strong_comp=xx*xx*(3.0-2.0*xx)
             best_comp_rel_boot=max(best_comp_rel_boot,strong_comp*triple_rel)
-            pair_best=None
             for st in states:
                 if st=="6/8":
                     role=0.12+0.88*comp
@@ -1439,9 +1617,7 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
                     role=0.34+0.66*(1.0-comp)
                 ww=float(w)*max(0.05,role)
                 numer[st]+=ww*loc[st]; den[st]+=ww; best_local[st]=max(best_local[st],loc[st])
-                ps=ww*loc[st]
-                if pair_best is None or ps>pair_best[0]: pair_best=(ps,b,st)
-            if pair_best: best_pairs.append(pair_best)
+                conditional_pairs[st][float(b)] = ww * loc[st]
         bscores={st:0.74*(numer[st]/max(den[st],1e-8))+0.26*best_local[st] for st in states}
         bscores["6/8"]*=1.0+0.45*best_comp_rel_boot
         bz=sum(bscores.values())+1e-8
@@ -1461,12 +1637,23 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
                 bz=sum(bscores.values())+1e-8
                 bscores={st:bscores[st]/bz for st in states}
 
-        st_win=max(bscores,key=bscores.get); meter_boot[st_win]+=1
-        if best_pairs:
-            _,bwin,swin=max(best_pairs,key=lambda x:x[0]); joint_boot[(round(float(bwin),2),swin)]+=1
+        # Reamostra somente as quatro pequenas medições já calculadas, sem
+        # reprocessar áudio e sem custo extra de inferência neural.
+        if phrase_profile.get("valid") and phrase_profile.get("window_deltas"):
+            dv = np.asarray(phrase_profile["window_deltas"], dtype=float)
+            rids = rng.integers(0, len(dv), size=len(dv))
+            b_phrase = _phrase_8v16_evidence(dv[rids], phrase_profile["tempo_cv"])
+            bscores, _ = _apply_dual_bar_specialist(bscores, b_phrase, raw_calibration_stats)
+
+        st_win=max(bscores,key=bscores.get)
+        meter_boot[st_win]+=1
+        # A hipótese conjunta DEVE usar o mesmo compasso final que recebeu voto,
+        # não um vencedor de um estágio intermediário anterior à calibração.
+        conditioned_votes = conditional_pairs[st_win]
+        bwin = max(conditioned_votes, key=conditioned_votes.get) if conditioned_votes else chosen_bpm
+        joint_boot[(round(float(bwin),2), st_win)]+=1
     bootstrap_stability=meter_boot[best_ts]/float(max(1,n_boot))
-    best_joint_pair=max(joint_boot,key=joint_boot.get) if joint_boot else (round(chosen_bpm,2),best_ts)
-    joint_stability=joint_boot.get(best_joint_pair,0)/float(max(1,n_boot))
+    joint_stability=joint_boot.get((round(float(chosen_bpm),2),best_ts),0)/float(max(1,n_boot))
 
     # ---------- qualidades separadas ----------
     grouping_quality=float(np.mean([e["grouping_quality"] for e in seg_evals_chosen]))
@@ -1512,6 +1699,14 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
     if pair=={"2/4","4/4"} and hierarchy_quality<0.035:
         structural_ok=False; reasons.append(f"hierarquia 2x4 pouco discriminante ({hierarchy_quality:.3f})")
 
+    # Contradição de evidências: a classificação binária não deve ficar
+    # confiante quando as frases se opõem ao motor local.
+    if best_ts == "2/4" and phrase_profile.get("valid") and \
+            phrase_profile.get("support_4", 0.0) >= CONFIG_DUAL_BAR["conflict_min_support"]:
+        penalty_dual = CONFIG_DUAL_BAR["conflict_margin_penalty"]
+        eff_thr = min(conf["max_margin_abs"], eff_thr + penalty_dual)
+        reasons.append("dupla interpretação 2/4 x 4/4 nas frases longas")
+
     accept=(
         meter_margin>=eff_thr and
         meter_confidence>=conf["min_meter_confidence"] and
@@ -1540,10 +1735,18 @@ def run_hierarchical_meter_inference(tempo_data, dedup_notes, sr, log: Technical
         meter_sections = [{"start_sec":0.0,"time_sig":best_ts}]
 
     # ---------- log auditável ----------
-    log.add("\n==============================\nA4.2 TATUM -> PULSE -> BAR ENGINE\n==============================")
+    log.add("\n==============================\nA4.3 TATUM -> PULSE -> BAR + DUAL-LEVEL BAR ENGINE\n==============================")
     log.add(f"Tactus avaliados: {[round(float(b),2) for b in candidate_bpms]}")
     log.add(f"Meter marginalizado/calibrado: { {k:round(v,4) for k,v in meter_scores.items()} }")
     log.add(f"RAW-GRID CALIBRATION: peso={raw_calibration_weight:.3f} | stats={ {k:round(v,3) for k,v in raw_calibration_stats.items()} } | prior={ {k:round(v,3) for k,v in raw_calibration_prior.items()} }")
+    log.add(f"DUAL-LEVEL BAR: valid={phrase_profile.get('valid')} | "
+            f"phrase_delta_median={phrase_profile.get('median')} | "
+            f"negative_fraction={phrase_profile.get('negative_fraction')} | "
+            f"tempo_cv={phrase_profile.get('tempo_cv')} | "
+            f"support_4={phrase_profile.get('support_4',0.0):.3f} | "
+            f"adjustment={dual_bar_info}")
+    for item in phrase_profile.get("windows", []):
+        log.add(f"  PHRASE WINDOW: {item}")
     log.add(f"Melhor compasso={best_ts} ({best_sc:.4f}) | 2º={sec_ts} ({sec_sc:.4f}) | margem={meter_margin:.4f}")
     log.add(f"Tactus condicionado ao compasso: {chosen_bpm:.2f} BPM | tactus_quality={tactus_quality:.3f}")
     log.add(f"VITERBI RAW={raw_path} | ESTABILIZADO={path} | Sections={meter_sections}")
@@ -2405,6 +2608,7 @@ if uploaded_file is not None:
         log.add(f"CONFIG_SIGNAL: {CONFIG_SIGNAL}")
         log.add(f"CONFIG_TACTUS: {CONFIG_TACTUS}")
         log.add(f"CONFIG_METER: {CONFIG_METER}")
+        log.add(f"CONFIG_DUAL_BAR: {CONFIG_DUAL_BAR}")
         log.add(f"CONFIG_CONFIDENCE: {CONFIG_CONFIDENCE}")
         log.add(f"CONFIG_MELODY: {CONFIG_MELODY}")
         log.add(f"CONFIG_HARMONY: {CONFIG_HARMONY}")
